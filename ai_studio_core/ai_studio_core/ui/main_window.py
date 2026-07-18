@@ -29,12 +29,14 @@ from .controllers import (
 )
 from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
 from .panels import (
-    HistoryPanel, ModelHubPanel, QueuePanel, SettingsPanel,
+    HistoryPanel, InspectorPanel, ModelHubPanel, QueuePanel, SettingsPanel,
 )
 from .widgets.log_console import LogConsole
 from .widgets.status_bar import ResourceStatusBar
 from .widgets.toast import Toast
-from .workspaces import ChatWorkspace, PipelineWorkspace, TTSWorkspace
+from .workspaces import (
+    ChatWorkspace, ImageWorkspace, PipelineWorkspace, TTSWorkspace,
+)
 
 
 class MainWindow(QMainWindow):
@@ -107,10 +109,12 @@ class MainWindow(QMainWindow):
 
         self._tts_workspace = TTSWorkspace(controller=self._tts_ctrl)
         self._chat_workspace = ChatWorkspace(controller=self._chat_ctrl)
+        self._image_workspace = ImageWorkspace()
         self._pipeline_workspace = PipelineWorkspace()
 
         self._workspace_tabs.addTab(self._tts_workspace, "🎙  TTS")
         self._workspace_tabs.addTab(self._chat_workspace, "💬  Chat")
+        self._workspace_tabs.addTab(self._image_workspace, "🖼  Image")
         self._workspace_tabs.addTab(self._pipeline_workspace, "🔗  Pipeline")
 
         self.setCentralWidget(self._workspace_tabs)
@@ -123,6 +127,11 @@ class MainWindow(QMainWindow):
         self._settings_dock = self._create_dock(
             "Settings", SettingsPanel(), Qt.DockWidgetArea.RightDockWidgetArea
         )
+        self._inspector_dock = self._create_dock(
+            "Inspector", InspectorPanel(), Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.tabifyDockWidget(self._settings_dock, self._inspector_dock)
+        self._settings_dock.raise_()
         self._queue_dock = self._create_dock(
             "Queue", QueuePanel(), Qt.DockWidgetArea.BottomDockWidgetArea
         )

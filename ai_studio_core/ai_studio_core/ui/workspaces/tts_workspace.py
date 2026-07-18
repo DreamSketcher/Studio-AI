@@ -223,3 +223,42 @@ class TTSWorkspace(BaseWorkspace):
     def set_busy(self, busy: bool) -> None:
         self._btn_generate.setEnabled(not busy)
         self._btn_stop.setEnabled(busy)
+        self._btn_export.setEnabled(not busy)
+
+    # ── Helpers ──
+
+    @staticmethod
+    def _accent_btn_style() -> str:
+        """Стиль основной (accent) кнопки в тулбаре workspace'а."""
+        return (
+            f"QToolButton {{ background: {TOKENS.colors.accent_primary}; "
+            f"color: {TOKENS.colors.text_on_accent}; "
+            f"border: none; border-radius: {TOKENS.radius.md}px; "
+            f"padding: {TOKENS.spacing.sm}px {TOKENS.spacing.lg}px; "
+            f"font-weight: 600; }}"
+            f"QToolButton:hover {{ background: #6d28d9; }}"
+            f"QToolButton:disabled {{ background: {TOKENS.colors.bg_elevated}; "
+            f"color: {TOKENS.colors.text_disabled}; }}"
+        )
+
+    def _on_generate(self) -> None:
+        """Собирает параметры из сайдбара и эмитит generate_requested."""
+        text = self._text_input.toPlainText().strip()
+        if not text:
+            return
+        params = {
+            "language": self._combo_lang.currentText(),
+            "temperature": self._slider_temp.value() / 100,
+            "speed": self._slider_speed.value() / 100,
+            "top_p": self._slider_top_p.value() / 100,
+            "repetition_penalty": self._slider_rep.value() / 100,
+            "rvc_enabled": self._rvc_enable.isChecked(),
+            "rvc_model": self._rvc_model.currentText(),
+            "rvc_index_rate": self._slider_index.value() / 100,
+            "rvc_pitch": self._slider_pitch.value(),
+            "output_format": self._out_format.currentText().lower(),
+            "sample_rate": int(self._out_sr.currentText()),
+            "autoplay": self._out_autoplay.isChecked(),
+            "reference_audio": self._ref_drop.current_path(),
+        }
+        self.generate_requested.emit(text, params)

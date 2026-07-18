@@ -13,7 +13,11 @@ from ..theme.tokens import TOKENS
 class TagInput(QWidget):
     tags_changed = Signal(list)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        placeholder: str = "add tag…",
+    ):
         super().__init__(parent)
         self._tags: list[str] = []
 
@@ -40,7 +44,7 @@ class TagInput(QWidget):
         root.addWidget(scroll, 1)
 
         self._input = QLineEdit()
-        self._input.setPlaceholderText("add tag…")
+        self._input.setPlaceholderText(placeholder)
         self._input.setFixedWidth(120)
         self._input.returnPressed.connect(self._add_from_input)
         root.addWidget(self._input)

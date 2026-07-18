@@ -29,7 +29,7 @@ class TTSController(BaseController):
             from ai_studio_core.normalizer import TextNormalizer
             from ai_studio_core.chunker import TextChunker
             self._normalize_fn = TextNormalizer().normalize
-            self._chunk_fn = TextChunker().chunk
+            self._chunk_fn = TextChunker().chunk_text
             self._engine_loaded = True
             self.status_message.emit("TTS engine loaded")
             self.log_message.emit("INFO", "TTS engine dependencies loaded")

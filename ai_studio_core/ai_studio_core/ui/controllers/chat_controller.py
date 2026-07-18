@@ -31,7 +31,8 @@ class ChatController(BaseController):
 
     @Slot(str)
     def on_send(self, user_message: str, system_prompt: str = "", model: str = "", temperature: float = 0.7) -> None:
-        self.message_added.emit("user", user_message)
+        # User-пузырь уже отрисован workspace'ом, повторно не добавляем,
+        # иначе в UI появится дубликат сообщения.
         if not self._ensure_client():
             self.message_added.emit("assistant",
                 "[Локальный LLM-клиент пока не настроен. Это демонстрационный UI — "
