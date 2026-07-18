@@ -1,12 +1,19 @@
-"""Универсальный селектор модели/провайдера."""
+"""Универсальный селектор модели/провайдера.
+
+Без демо-данных: виджет стартует пустым и наполняется только через
+set_models() реальными данными контроллера — каталогом моделей активного
+провайдера, списком доступных TTS-бэкендов или файлами моделей на диске.
+"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QComboBox, QWidget
+
+_STATUS_ICONS = {"ready": "✅", "download": "📥", "error": "❌", "loading": "⏳"}
 
 
 class ModelSelector(QComboBox):
-    model_changed = Signal(str)
+    model_changed = Signal(str)  # id выбранной модели (userData)
 
     def __init__(
         self,
@@ -20,32 +27,61 @@ class ModelSelector(QComboBox):
         self.setMinimumWidth(220)
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-
-        if category == "tts":
-            self.addItems(["XTTS v2.0.2", "XTTS v2.0.1", "StyleTTS2", "Bark-small"])
-        elif category == "llm":
-            self.addItems(["GPT-4o", "GPT-4o-mini", "Claude 3.5 Sonnet", "Groq Llama 3.1 70B", "Local: Llama 3.1 8B"])
-        elif category == "rvc":
-            self.addItems(["(none)", "Male v2", "Female v1", "Custom…"])
-        else:
-            self.addItem(placeholder)
-
+        # Список пуст до вызова set_models() — никаких заглушек.
         self.currentTextChanged.connect(self._on_changed)
 
     def set_models(self, models: list[dict]) -> None:
-        self.clear()
-        current_provider = None
-        for m in models:
-            provider = m.get("provider", "")
-            if provider != current_provider:
-                if current_provider is not None:
-                    self.insertSeparator(self.count())
-                current_provider = provider
-            status_icon = {"ready": "✅", "download": "📥", "error": "❌", "loading": "⏳"}.get(m.get("status", ""), "")
-            display = f"{status_icon} {m['name']}  ({provider})" if status_icon else m["name"]
-            self.addItem(display, userData=m.get("id"))
+        """Пересобирает список БЕЗ эмиссии model_changed.
 
-    def _on_changed(self, text: str) -> None:
+        models: [{"id": str, "name": str, "provider": str,
+                  "status": ready|download|error|loading, "current": bool}]
+        Запись с current=True программно выбирается (тоже без сигнала).
+        """
+        self.blockSignals(True)
+        try:
+            self.clear()
+            current_provider = None
+            current_idx = -1
+            for m in models:
+                provider = m.get("provider", "")
+                if provider != current_provider:
+                    if current_provider is not None:
+                        self.insertSeparator(self.count())
+                    current_provider = provider
+                icon = _STATUS_ICONS.get(m.get("status", ""), "")
+                name = m.get("name", m.get("id", ""))
+                if icon and provider:
+                    display = f"{icon} {name}  ({provider})"
+                elif icon:
+                    display = f"{icon} {name}"
+                else:
+                    display = name
+                self.addItem(display, userData=m.get("id"))
+                if m.get("current"):
+                    current_idx = self.count() - 1
+            if current_idx >= 0:
+                self.setCurrentIndex(current_idx)
+            elif self.count():
+                self.setCurrentIndex(0)
+        finally:
+            self.blockSignals(False)
+
+    def current_model_id(self) -> str:
+        """id выбранной записи (userData), '' если список пуст/id не задан."""
+        data = self.currentData()
+        return str(data) if data else ""
+
+    def select_id(self, model_id: str) -> bool:
+        """Программно выбирает запись по id без эмиссии model_changed."""
+        idx = self.findData(model_id)
+        if idx < 0:
+            return False
+        was = self.blockSignals(True)
+        self.setCurrentIndex(idx)
+        self.blockSignals(was)
+        return True
+
+    def _on_changed(self, _text: str) -> None:
         model_id = self.currentData()
         if model_id:
             self.model_changed.emit(str(model_id))

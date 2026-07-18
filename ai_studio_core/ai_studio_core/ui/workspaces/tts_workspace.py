@@ -254,6 +254,14 @@ class TTSWorkspace(BaseWorkspace):
     def set_text(self, text: str) -> None:
         self._text_input.setPlainText(text)
 
+    def model_selector(self) -> ModelSelector:
+        """Селектор TTS-движка в тулбаре (наполняется реальными бэкендами)."""
+        return self._model_selector
+
+    def rvc_selector(self) -> ModelSelector:
+        """Селектор RVC-модели (наполняется реальным сканом models/ на .pth)."""
+        return self._rvc_model
+
     def waveform_widget(self) -> WaveformView:
         return self._waveform
 
@@ -295,7 +303,7 @@ class TTSWorkspace(BaseWorkspace):
             "top_p": self._slider_top_p.value() / 100,
             "repetition_penalty": self._slider_rep.value() / 100,
             "rvc_enabled": self._rvc_enable.isChecked(),
-            "rvc_model": self._rvc_model.currentText(),
+            "rvc_model": self._rvc_model.current_model_id(),
             "rvc_index_rate": self._slider_index.value() / 100,
             "rvc_pitch": self._slider_pitch.value(),
             "output_format": self._out_format.currentText().lower(),

@@ -31,6 +31,7 @@ class SettingsPanel(QWidget):
     settings_changed = Signal(dict)     # полный снапшот настроек
     language_changed = Signal(str)      # код языка ("en"/"ru")
     paths_changed = Signal(str, str)    # (kind: "models"/"output", path)
+    llm_saved = Signal(str)             # id сохранённого провайдера
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -105,6 +106,39 @@ class SettingsPanel(QWidget):
         self._paths_group.set_content_layout(paths_form)
         layout.addWidget(self._paths_group)
 
+        # ── LLM Provider (реальные ключи/провайдер через gpt_client) ──
+        self._llm_group = CollapsibleGroup("")
+        llm_form = QFormLayout()
+
+        from PySide6.QtWidgets import QLineEdit
+        self._provider = QComboBox()
+        self._provider_lbl = QLabel()
+        llm_form.addRow(self._provider_lbl, self._provider)
+
+        self._api_key = QLineEdit()
+        self._api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_key.setClearButtonEnabled(True)
+        self._api_key_lbl = QLabel()
+        llm_form.addRow(self._api_key_lbl, self._api_key)
+
+        self._key_state = QLabel()
+        self._key_state.setStyleSheet(
+            f"color: {TOKENS.colors.text_secondary}; "
+            f"font-size: {TOKENS.font_size.caption}px;"
+        )
+        llm_form.addRow(self._key_state)
+
+        self._btn_save_llm = QPushButton()
+        self._btn_save_llm.clicked.connect(self._save_llm)
+        llm_form.addRow(self._btn_save_llm)
+
+        # Все виджеты группы созданы — можно безопасно наполнять комбобокс
+        self._provider.currentIndexChanged.connect(lambda _i: self._refresh_key_state())
+        self._rebuild_providers()
+
+        self._llm_group.set_content_layout(llm_form)
+        layout.addWidget(self._llm_group)
+
         # ── About ──
         self._about_group = CollapsibleGroup("")
         about_form = QVBoxLayout()
@@ -171,7 +205,77 @@ class SettingsPanel(QWidget):
         self._paths_group.set_title(tr("set_paths"))
         self._models_lbl.setText(tr("set_models_dir"))
         self._output_lbl.setText(tr("set_output_dir"))
+        self._llm_group.set_title(tr("set_llm"))
+        self._provider_lbl.setText(tr("set_provider"))
+        self._api_key_lbl.setText(tr("set_api_key"))
+        self._api_key.setPlaceholderText(tr("set_api_key_ph"))
+        self._btn_save_llm.setText(tr("set_save"))
+        # Подписи провайдеров зависят от языка — перечитываем из gpt_client
+        self._rebuild_providers()
         self._about_group.set_title(tr("set_about"))
+
+    # ── LLM provider (real gpt_client persistence) ──
+
+    def _rebuild_providers(self) -> None:
+        """Наполняет комбобокс провайдеров из gpt_client (с подписями i18n)."""
+        try:
+            from ai_studio_core import gpt_client
+            gpt_client.refresh_i18n_labels()
+            providers = []
+            for pid, info in gpt_client.PROVIDERS.items():
+                providers.append((pid, info.get("label", pid)))
+            for entry in gpt_client.list_custom_providers():
+                if entry.get("id") not in gpt_client.PROVIDERS:
+                    providers.append((entry["id"], entry.get("label", entry["id"])))
+            current = gpt_client.get_provider()
+        except Exception:
+            providers, current = [], ""
+        self._provider.blockSignals(True)
+        self._provider.clear()
+        for pid, label in providers:
+            self._provider.addItem(label, userData=pid)
+        if current:
+            idx = self._provider.findData(current)
+            if idx >= 0:
+                self._provider.setCurrentIndex(idx)
+        self._provider.blockSignals(False)
+        self._refresh_key_state()
+
+    def selected_provider(self) -> str:
+        return self._provider.currentData() or ""
+
+    def _refresh_key_state(self) -> None:
+        pid = self.selected_provider()
+        configured = False
+        if pid:
+            try:
+                from ai_studio_core import gpt_client
+                configured = bool(gpt_client.get_api_key(pid)) or pid == "local"
+            except Exception:
+                configured = False
+        key = "set_key_state_ok" if configured else "set_key_state_missing"
+        self._key_state.setText(tr(key))
+        color = TOKENS.colors.accent_success if configured else TOKENS.colors.accent_warning
+        self._key_state.setStyleSheet(
+            f"color: {color}; font-size: {TOKENS.font_size.caption}px;"
+        )
+
+    def _save_llm(self) -> None:
+        pid = self.selected_provider()
+        if not pid:
+            return
+        try:
+            from ai_studio_core import gpt_client
+            gpt_client.set_provider(pid)
+            key = self._api_key.text().strip()
+            if key:
+                gpt_client.set_api_key(key, pid)
+                self._api_key.clear()
+        except Exception as e:
+            self._key_state.setText(f"⚠ {type(e).__name__}: {e}")
+            return
+        self._refresh_key_state()
+        self.llm_saved.emit(pid)
 
     # ── Internals ──
 

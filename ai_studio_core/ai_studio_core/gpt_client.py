@@ -676,7 +676,8 @@ def apply_key_from_library(key_id: str) -> dict:
 
 
 def _call_api(
-    messages: list, model: str = None, max_tokens: int = 2048, provider: str = None
+    messages: list, model: str = None, max_tokens: int = 2048,
+    provider: str = None, temperature: float = 0.7,
 ) -> str:
     provider = provider or get_provider()
 
@@ -709,7 +710,7 @@ def _call_api(
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.7,
+            "temperature": float(temperature),
         }
     ).encode("utf-8")
 
@@ -906,7 +907,7 @@ def get_chain_diagnostics() -> dict:
     }
 
 
-def _call_with_chain(messages: list, max_tokens: int = 2048) -> str:
+def _call_with_chain(messages: list, max_tokens: int = 2048, temperature: float = 0.7) -> str:
     """
     Пробует все провайдеры из цепочки по очереди (primary, затем fallback модель
     каждого). Сетевая ошибка прерывает попытки ТОЛЬКО для текущего провайдера
@@ -930,7 +931,10 @@ def _call_with_chain(messages: list, max_tokens: int = 2048) -> str:
         for model in models_to_try:
             total_attempts += 1
             try:
-                return _call_api(messages, model=model, max_tokens=max_tokens, provider=provider)
+                return _call_api(
+                    messages, model=model, max_tokens=max_tokens,
+                    provider=provider, temperature=temperature,
+                )
             except GroqNetworkError as e:
                 network_failures += 1
                 print(f"[AI] {provider}/{model}: недоступен по сети ({e}), пробую дальше...")
@@ -984,7 +988,8 @@ _TTS_SYSTEM = (
 # ── public API ─────────────────────────────────────────────────────────────────
 
 
-def chat(prompt: str, history: list = None, system: str = None) -> str:
+def chat(prompt: str, history: list = None, system: str = None,
+         max_tokens: int = 2048, temperature: float = 0.7) -> str:
     """
     Free chat. history — list of {"role": "user"/"assistant", "content": "..."}.
     Пробует все провайдеры из цепочки (см. _call_with_chain).
@@ -996,7 +1001,7 @@ def chat(prompt: str, history: list = None, system: str = None) -> str:
         messages.extend(history)
     messages.append({"role": "user", "content": prompt})
 
-    return _call_with_chain(messages, max_tokens=2048)
+    return _call_with_chain(messages, max_tokens=max_tokens, temperature=temperature)
 
 
 def improve_for_tts(text: str) -> str:

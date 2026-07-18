@@ -52,7 +52,8 @@ class ChatBubble(QFrame):
 
 
 class ChatWorkspace(BaseWorkspace):
-    send_requested = Signal(str, str, str, float)  # (message, system, model, temperature)
+    # (message, system, model_id, temperature, max_tokens)
+    send_requested = Signal(str, str, str, float, int)
     stop_requested = Signal()
     clear_requested = Signal()
 
@@ -248,11 +249,16 @@ class ChatWorkspace(BaseWorkspace):
         self._chat_layout.addWidget(ChatBubble("user", text))
         self._input.clear()
         self._update_context_labels()
+        try:
+            max_tokens = int(self._max_tokens.currentText())
+        except ValueError:
+            max_tokens = 2048
         self.send_requested.emit(
             text,
             self._system_prompt.toPlainText(),
-            self._model_selector.currentText(),
+            self._model_selector.current_model_id(),
             self._temp_slider.value() / 100,
+            max_tokens,
         )
 
     def _on_clear(self) -> None:
@@ -271,6 +277,13 @@ class ChatWorkspace(BaseWorkspace):
         # Автоскролл вниз
         sb = self._scroll.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def set_models(self, models: list[dict]) -> None:
+        """Наполняет селектор реальным каталогом активного провайдера."""
+        self._model_selector.set_models(models)
+
+    def model_selector(self) -> ModelSelector:
+        return self._model_selector
 
     def set_busy(self, busy: bool) -> None:
         self._btn_send.setEnabled(not busy)

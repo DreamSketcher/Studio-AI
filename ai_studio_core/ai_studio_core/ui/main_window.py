@@ -279,6 +279,16 @@ class MainWindow(QMainWindow):
         self._chat_ctrl.log_message.connect(self._log_widget.append)
         self._chat_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
 
+        # Селекторы моделей наполняются реальными данными контроллеров
+        chat_sel = self._chat_workspace.model_selector()
+        chat_sel.model_changed.connect(self._chat_ctrl.select_model)
+        self._refresh_chat_models()
+        tts_sel = self._tts_workspace.model_selector()
+        tts_sel.model_changed.connect(self._tts_ctrl.select_backend)
+        tts_sel.set_models(self._tts_ctrl.available_models())
+        self._tts_workspace.rvc_selector().set_models(self._tts_ctrl.rvc_models())
+        self._settings_widget.llm_saved.connect(self._on_llm_saved)
+
         # History: выбор элемента → Inspector
         self._history_widget.item_selected.connect(self._on_history_selected)
 
@@ -293,6 +303,21 @@ class MainWindow(QMainWindow):
         self._queue_widget.clear_completed.connect(self._queue_ctrl.clear_completed)
         self._queue_ctrl.queue_changed.connect(self._queue_widget.set_tasks)
         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
+
+    def _refresh_chat_models(self) -> None:
+        """Каталог моделей активного провайдера → селектор чата."""
+        try:
+            models = self._chat_ctrl.available_models()
+        except Exception as e:
+            self._log_widget.append("WARN", f"chat model list failed: {e}")
+            models = []
+        self._chat_workspace.set_models(models)
+
+    def _on_llm_saved(self, pid: str) -> None:
+        """Settings → LLM Provider: провайдер/ключ сохранены в gpt_settings."""
+        self._refresh_chat_models()
+        self._toast(tr("set_key_saved"), "success")
+        self._log_widget.append("INFO", f"LLM provider saved: {pid}")
 
     def _on_tts_step(self, idx: int, state: str) -> None:
         strip = self._tts_workspace.pipeline()

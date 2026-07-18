@@ -81,6 +81,7 @@ class TTSController(BaseController):
         self._normalize_fn = None
         self._chunk_fn = None
         self._backend: str | None = None
+        self._preferred_backend = "auto"  # auto | coqui | espeak
         self._queue = None          # QueueController (attach_queue)
         self._task_id: str | None = None
         self._last_output: str | None = None
@@ -90,8 +91,56 @@ class TTSController(BaseController):
     def backend(self) -> str | None:
         return self._backend
 
+    def preferred_backend(self) -> str:
+        return self._preferred_backend
+
     def last_output(self) -> str | None:
         return self._last_output
+
+    def available_models(self) -> list[dict]:
+        """Реальные TTS-движки для селектора: статус отражает фактическую
+        доступность в текущем окружении (без обещаний несуществующего)."""
+        from ai_studio_core import espeak_tts
+        pref = self._preferred_backend
+        return [
+            {"id": "auto", "name": tr("model_auto"), "provider": "",
+             "status": "ready", "current": pref == "auto"},
+            {"id": "coqui", "name": "Coqui XTTS v2", "provider": tr("prov_engines"),
+             "status": "ready" if _coqui_available() else "download",
+             "current": pref == "coqui"},
+            {"id": "espeak", "name": "espeak-ng", "provider": tr("prov_engines"),
+             "status": "ready" if espeak_tts.available() else "error",
+             "current": pref == "espeak"},
+        ]
+
+    @Slot(str)
+    def select_backend(self, backend_id: str) -> None:
+        """Фиксирует выбранный движок; 'auto' — автоопределение (coqui→espeak)."""
+        bid = (backend_id or "").strip() or "auto"
+        if bid not in ("auto", "coqui", "espeak"):
+            self.log_message.emit("WARN", f"unknown TTS backend: {backend_id}")
+            return
+        self._preferred_backend = bid
+        self._backend = None  # пересчитается при следующей генерации
+        self.status_message.emit(f"TTS backend: {bid}")
+
+    def rvc_models(self) -> list[dict]:
+        """Реальный скан каталога моделей на .pth-файлы RVC.
+
+        Ничего не найдено — честно пустой список (RVC-гейт в on_generate
+        всё равно не пропустит конвертацию без бэкенда)."""
+        import glob
+        out: list[dict] = []
+        try:
+            from ai_studio_core.paths import MODEL_DIR
+            if os.path.isdir(MODEL_DIR):
+                for p in sorted(glob.glob(os.path.join(MODEL_DIR, "**", "*.pth"),
+                                          recursive=True)):
+                    out.append({"id": p, "name": os.path.basename(p),
+                                "provider": "RVC", "status": "ready"})
+        except Exception as e:
+            self.log_message.emit("WARN", f"RVC model scan failed: {e}")
+        return out
 
     def attach_queue(self, queue_controller) -> None:
         """Подключает очередь задач: генерация регистрирует в ней реальную задачу."""
@@ -129,11 +178,21 @@ class TTSController(BaseController):
 
     def _ensure_backend(self) -> bool:
         if self._backend is None:
-            self._backend = _detect_backend()
+            self._backend = self._resolve_backend()
             if self._backend:
                 self.backend_changed.emit(self._backend)
                 self.log_message.emit("INFO", f"TTS backend: {self._backend}")
         return self._backend is not None
+
+    def _resolve_backend(self) -> str | None:
+        """Уважает выбор пользователя: закреплённый движок проверяется честно,
+        авто — coqui→espeak по факту доступности."""
+        if self._preferred_backend == "coqui":
+            return "coqui" if _coqui_available() else None
+        if self._preferred_backend == "espeak":
+            from ai_studio_core import espeak_tts
+            return "espeak" if espeak_tts.available() else None
+        return _detect_backend()
 
     # ── Генерация ──
 
@@ -144,8 +203,13 @@ class TTSController(BaseController):
 
         if not engine_ok or not backend_ok:
             self.pipeline_step_changed.emit(0, "error")
-            self.error_occurred.emit(tr("ctl_tts_missing"))
-            self.status_message.emit(tr("ctl_tts_missing"))
+            if backend_ok is False and self._preferred_backend not in ("", "auto"):
+                # Пользователь явно выбрал движок — говорим именно про него
+                msg = f'{tr("ctl_backend_missing")}: {self._preferred_backend}'
+            else:
+                msg = tr("ctl_tts_missing")
+            self.error_occurred.emit(msg)
+            self.status_message.emit(msg)
             return
 
         if params.get("rvc_enabled"):

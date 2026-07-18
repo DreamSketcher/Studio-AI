@@ -200,7 +200,7 @@ class TestCallWithChain:
 
         calls = []
 
-        def fake_call_api(messages, model=None, max_tokens=0, provider=None):
+        def fake_call_api(messages, model=None, max_tokens=0, provider=None, temperature=0.7):
             calls.append(model)
             if model == "primary":
                 raise GroqRateLimitError("429")
@@ -217,7 +217,7 @@ class TestCallWithChain:
         monkeypatch.setattr(gpt_client, "get_model", lambda pid: f"{pid}_model")
         monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: f"{pid}_model")
 
-        def fake_api(messages, model=None, max_tokens=0, provider=None):
+        def fake_api(messages, model=None, max_tokens=0, provider=None, temperature=0.7):
             if provider == "groq":
                 raise GroqNetworkError("no internet")
             return f"ok from {provider}"
@@ -256,7 +256,7 @@ class TestCallWithChain:
         monkeypatch.setattr(gpt_client, "get_model", lambda pid: "m")
         monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "m")
 
-        def fake_api(messages, model=None, max_tokens=0, provider=None):
+        def fake_api(messages, model=None, max_tokens=0, provider=None, temperature=0.7):
             if provider == "groq":
                 raise RuntimeError("unexpected")
             return "ok openrouter"
