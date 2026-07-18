@@ -262,14 +262,37 @@ class ChatWorkspace(BaseWorkspace):
         )
 
     def _on_clear(self) -> None:
+        self._reset_chat([])
+        self.clear_requested.emit()
+
+    def _reset_chat(self, history: list[dict]) -> None:
+        """Пересобирает пузыри из истории (пусто → приветствие)."""
         while self._chat_layout.count():
             item = self._chat_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        self._greeting_bubble = ChatBubble("assistant", tr("chat_greeting"))
-        self._chat_layout.addWidget(self._greeting_bubble)
+        if not history:
+            self._greeting_bubble = ChatBubble("assistant", tr("chat_greeting"))
+            self._chat_layout.addWidget(self._greeting_bubble)
+        else:
+            for msg in history:
+                role = msg.get("role", "assistant")
+                if role not in ("user", "assistant"):
+                    continue
+                self._chat_layout.addWidget(
+                    ChatBubble(role, msg.get("content", "")))
+            self._greeting_bubble = None
         self._update_context_labels()
-        self.clear_requested.emit()
+
+    def load_messages(self, history: list[dict]) -> None:
+        """Загрузка истории из сохранённого проекта."""
+        self._reset_chat(history)
+
+    def system_prompt(self) -> str:
+        return self._system_prompt.toPlainText()
+
+    def set_system_prompt(self, text: str) -> None:
+        self._system_prompt.setPlainText(text or "")
 
     def add_message(self, role: str, content: str) -> None:
         self._chat_layout.addWidget(ChatBubble(role, content))

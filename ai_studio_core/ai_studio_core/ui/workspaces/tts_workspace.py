@@ -291,12 +291,9 @@ class TTSWorkspace(BaseWorkspace):
             f"color: {TOKENS.colors.text_disabled}; }}"
         )
 
-    def _on_generate(self) -> None:
-        """Собирает параметры из сайдбара и эмитит generate_requested."""
-        text = self._text_input.toPlainText().strip()
-        if not text:
-            return
-        params = {
+    def current_params(self) -> dict:
+        """Текущие параметры сайдбара (для генерации и сохранения проекта)."""
+        return {
             "language": self._combo_lang.currentText(),
             "temperature": self._slider_temp.value() / 100,
             "speed": self._slider_speed.value() / 100,
@@ -311,4 +308,40 @@ class TTSWorkspace(BaseWorkspace):
             "autoplay": self._out_autoplay.isChecked(),
             "reference_audio": self._ref_drop.current_path(),
         }
-        self.generate_requested.emit(text, params)
+
+    def apply_params(self, params: dict) -> None:
+        """Восстановление параметров сайдбара из сохранённого проекта."""
+        if not isinstance(params, dict):
+            return
+        if params.get("language"):
+            self._combo_lang.setCurrentText(str(params["language"]))
+        for slider, key in ((self._slider_temp, "temperature"),
+                            (self._slider_speed, "speed"),
+                            (self._slider_top_p, "top_p"),
+                            (self._slider_rep, "repetition_penalty"),
+                            (self._slider_index, "rvc_index_rate")):
+            if key in params:
+                try:
+                    slider.setValue(int(round(float(params[key]) * 100)))
+                except (TypeError, ValueError):
+                    pass
+        if "rvc_pitch" in params:
+            try:
+                self._slider_pitch.setValue(int(params["rvc_pitch"]))
+            except (TypeError, ValueError):
+                pass
+        if "rvc_enabled" in params:
+            self._rvc_enable.setChecked(bool(params["rvc_enabled"]))
+        if params.get("output_format"):
+            self._out_format.setCurrentText(str(params["output_format"]).upper())
+        if params.get("sample_rate"):
+            self._out_sr.setCurrentText(str(params["sample_rate"]))
+        if "autoplay" in params:
+            self._out_autoplay.setChecked(bool(params["autoplay"]))
+
+    def _on_generate(self) -> None:
+        """Собирает параметры из сайдбара и эмитит generate_requested."""
+        text = self._text_input.toPlainText().strip()
+        if not text:
+            return
+        self.generate_requested.emit(text, self.current_params())

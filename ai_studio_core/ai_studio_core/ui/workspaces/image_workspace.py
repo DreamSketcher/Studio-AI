@@ -240,6 +240,9 @@ class ImageWorkspace(BaseWorkspace):
 
     # ── Behavior ──
 
+    def model_selector(self) -> ModelSelector:
+        return self._model_selector
+
     def _on_generate(self) -> None:
         prompt = self._prompt.toPlainText().strip()
         if not prompt:

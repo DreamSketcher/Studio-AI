@@ -1,4 +1,10 @@
-"""Статус-бар с мониторингом ресурсов (GPU, VRAM, CPU, Queue)."""
+"""Статус-бар с мониторингом ресурсов (GPU, VRAM, CPU, RAM, Queue).
+
+Честность показателей:
+  * CPU/RAM — psutil (реальные, раз в 2 с);
+  * GPU/VRAM — только если установлен torch и есть CUDA; иначе «—»;
+  * Queue — реальное число задач из QueueController (set_queue_size).
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import QTimer
@@ -25,9 +31,11 @@ class ResourceStatusBar(QStatusBar):
         self._gpu_label = self._make_indicator("GPU: —")
         self._vram_label = self._make_indicator("VRAM: — / —")
         self._cpu_label = self._make_indicator("CPU: —")
+        self._ram_label = self._make_indicator("RAM: —")
         self._queue_label = self._make_indicator("Queue: 0")
 
-        for w in (self._gpu_label, self._vram_label, self._cpu_label, self._queue_label):
+        for w in (self._gpu_label, self._vram_label, self._cpu_label,
+                  self._ram_label, self._queue_label):
             self.addPermanentWidget(w)
 
         self._poll_timer = QTimer(self)
@@ -37,6 +45,9 @@ class ResourceStatusBar(QStatusBar):
 
     def set_message(self, text: str) -> None:
         self._message_label.setText(text)
+
+    def set_queue_size(self, count: int) -> None:
+        self._queue_label.setText(f"Queue: {int(count)}")
 
     def update_stats(
         self,
@@ -58,7 +69,7 @@ class ResourceStatusBar(QStatusBar):
         if cpu_percent is not None:
             self._cpu_label.setText(f"CPU: {cpu_percent}%")
         if queue_size is not None:
-            self._queue_label.setText(f"Queue: {queue_size}")
+            self.set_queue_size(queue_size)
 
     @staticmethod
     def _make_indicator(text: str) -> QLabel:
@@ -75,12 +86,12 @@ class ResourceStatusBar(QStatusBar):
         return TOKENS.colors.accent_error
 
     def _poll_resources(self) -> None:
-        """Опрос CPU/памяти раз в 2с. GPU/VRAM опрашиваются только если torch есть."""
+        """Опрос CPU/RAM раз в 2 с. GPU/VRAM — только если torch+CUDA реально есть."""
         try:
             import psutil
             self._cpu_label.setText(f"CPU: {psutil.cpu_percent(interval=None):.0f}%")
             mem = psutil.virtual_memory()
-            self._queue_label.setText(f"RAM: {mem.percent:.0f}%")
+            self._ram_label.setText(f"RAM: {mem.percent:.0f}%")
         except Exception:
             pass
         try:

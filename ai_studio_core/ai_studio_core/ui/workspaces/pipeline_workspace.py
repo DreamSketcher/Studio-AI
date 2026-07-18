@@ -37,6 +37,7 @@ class PipelineNode(QFrame):
         self._lbl.setText(title)
 
     def set_state(self, state: str) -> None:
+        self._state = state
         colors = {
             "idle": self._base_color,
             "active": TOKENS.colors.accent_primary,

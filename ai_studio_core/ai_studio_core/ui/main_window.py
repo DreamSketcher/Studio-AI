@@ -30,7 +30,8 @@ from ai_studio_core import i18n
 from ai_studio_core.i18n import t as tr
 
 from .controllers import (
-    ChatController, ModelController, QueueController, TTSController,
+    ChatController, ImageController, ModelController, QueueController,
+    TTSController,
 )
 from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
 from .panels import (
@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
         # Контроллеры
         self._tts_ctrl = TTSController()
         self._chat_ctrl = ChatController()
+        self._image_ctrl = ImageController()
         self._model_ctrl = ModelController()
         self._queue_ctrl = QueueController()
 
@@ -289,19 +291,44 @@ class MainWindow(QMainWindow):
         self._tts_workspace.rvc_selector().set_models(self._tts_ctrl.rvc_models())
         self._settings_widget.llm_saved.connect(self._on_llm_saved)
 
+        # Image: честный контроллер (гейт бэкенда, без фейковых картинок)
+        self._image_workspace.generate_requested.connect(self._image_ctrl.on_generate)
+        self._image_workspace.stop_requested.connect(self._image_ctrl.on_stop)
+        self._image_ctrl.busy_changed.connect(self._image_workspace.set_busy)
+        self._image_ctrl.status_message.connect(self._resource_bar.set_message)
+        self._image_ctrl.log_message.connect(self._log_widget.append)
+        self._image_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
+        self._image_workspace.model_selector().set_models(
+            self._image_ctrl.available_models())
+
+        # Pipeline: кнопка Run гоняет ту же реальную TTS-цепочку,
+        # состояния нод = реальные этапы из контроллера
+        self._pipeline_workspace.run_requested.connect(self._on_pipeline_run)
+        self._pipeline_workspace.stop_requested.connect(self._tts_ctrl.on_stop)
+        self._tts_ctrl.busy_changed.connect(self._pipeline_workspace.set_busy)
+        self._tts_ctrl.pipeline_step_changed.connect(self._on_pipeline_step)
+        self._tts_ctrl.generation_started.connect(self._pipeline_workspace.reset_nodes)
+
         # History: выбор элемента → Inspector
         self._history_widget.item_selected.connect(self._on_history_selected)
 
-        # Model hub
-        self._model_widget.download_requested.connect(self._model_ctrl.download_model)
-        self._model_widget.delete_requested.connect(self._model_ctrl.delete_model)
+        # Model hub: реальный скан models/ + Inspector + скачивание/удаление
+        self._model_widget.refresh_requested.connect(self._model_ctrl.refresh)
+        self._model_widget.download_requested.connect(self._on_download_model)
+        self._model_widget.delete_requested.connect(self._on_model_delete)
+        self._model_widget.selection_changed.connect(self._on_model_selected)
+        self._model_ctrl.models_updated.connect(self._model_widget.set_models)
         self._model_ctrl.status_message.connect(self._resource_bar.set_message)
         self._model_ctrl.log_message.connect(self._log_widget.append)
+        self._model_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
+        self._model_ctrl.refresh()
 
         # Queue
         self._queue_widget.cancel_task.connect(self._queue_ctrl.cancel_task)
         self._queue_widget.clear_completed.connect(self._queue_ctrl.clear_completed)
         self._queue_ctrl.queue_changed.connect(self._queue_widget.set_tasks)
+        self._queue_ctrl.queue_changed.connect(
+            lambda tasks: self._resource_bar.set_queue_size(len(tasks)))
         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
 
     def _refresh_chat_models(self) -> None:
@@ -323,6 +350,38 @@ class MainWindow(QMainWindow):
         strip = self._tts_workspace.pipeline()
         if strip is not None:
             strip.set_step_state(idx, state)
+
+    def _on_pipeline_step(self, idx: int, state: str) -> None:
+        self._pipeline_workspace.set_node_state(idx, state)
+
+    def _on_pipeline_run(self, text: str) -> None:
+        """Run пайплайна = та же реальная TTS-цепочка (ноды = её этапы)."""
+        params = self._tts_workspace.current_params()
+        params["autoplay"] = False  # из пайплайна не дёргаем плеер без явной просьбы
+        self._tts_ctrl.on_generate(text, params)
+
+    def _on_model_selected(self, model: dict) -> None:
+        size_mb = model.get("size_bytes", 0) / (1024 * 1024)
+        props = {
+            "Category": model.get("category", "root"),
+            "Size": f"{size_mb:.1f} MB",
+            "Path": model.get("path", ""),
+        }
+        self._inspector_widget.show_item(
+            model.get("name", "?"), "MODEL", props,
+            details=model.get("path", ""),
+        )
+
+    def _on_model_delete(self, path: str) -> None:
+        import os
+        from PySide6.QtWidgets import QMessageBox
+        answer = QMessageBox.question(
+            self, tr("hub_delete"),
+            f'{tr("hub_delete")}: {os.path.basename(path)}?',
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._model_ctrl.delete_model(path)
 
     def _on_tts_done(self, output_path: str) -> None:
         self._resource_bar.set_message(f'{tr("msg_generation_complete")}: {output_path}')
@@ -369,15 +428,99 @@ class MainWindow(QMainWindow):
         self._settings.setValue(self._WINDOW_STATE_KEY, self.saveState())
         super().closeEvent(event)
 
-    # ── Menu slots (реальные реализации подключаются поэтапно) ──
+    # ── Project persistence (реальный JSON, без диалогов для тестов) ──
+    def _serialize_project(self) -> dict:
+        return {
+            "version": 1,
+            "language": i18n.get_language(),
+            "tts": {
+                "text": self._tts_workspace.text(),
+                "params": self._tts_workspace.current_params(),
+            },
+            "chat": {
+                "history": self._chat_ctrl.history(),
+                "system": self._chat_workspace.system_prompt(),
+                "model": self._chat_workspace.model_selector().current_model_id(),
+            },
+            "pipeline": {"text": self._pipeline_workspace._input.toPlainText()},
+        }
+
+    def _apply_project(self, data: dict) -> None:
+        if not isinstance(data, dict) or "version" not in data:
+            raise ValueError("not a project file")
+        if data.get("language"):
+            if i18n.set_language(str(data["language"])):
+                self._settings.setValue(self._LANGUAGE_KEY, str(data["language"]))
+                self.retranslate_ui()
+        tts = data.get("tts") or {}
+        self._tts_workspace.set_text(str(tts.get("text", "")))
+        self._tts_workspace.apply_params(tts.get("params") or {})
+        chat = data.get("chat") or {}
+        history = [h for h in (chat.get("history") or []) if isinstance(h, dict)]
+        self._chat_ctrl.set_history(history)
+        self._chat_workspace.load_messages(history)
+        self._chat_workspace.set_system_prompt(str(chat.get("system", "")))
+        if chat.get("model"):
+            self._chat_workspace.model_selector().select_id(str(chat["model"]))
+        pipe = data.get("pipeline") or {}
+        self._pipeline_workspace._input.setPlainText(str(pipe.get("text", "")))
+
+    def save_project_to(self, path: str) -> str:
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._serialize_project(), f, ensure_ascii=False, indent=2)
+        return path
+
+    def load_project_from(self, path: str) -> str:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self._apply_project(data)
+        return path
+
+    def _clear_project(self) -> None:
+        self._tts_workspace.set_text("")
+        self._chat_ctrl.set_history([])
+        self._chat_workspace.load_messages([])
+        self._chat_workspace.set_system_prompt("")
+        self._pipeline_workspace._input.setPlainText("")
+
+    # ── Menu slots ──
     def _on_new_project(self) -> None:
-        self._toast(tr("msg_menu_stub"), "info")
+        self._clear_project()
+        self._toast(tr("proj_new_done"), "info")
+        self._resource_bar.set_message(tr("proj_new_done"))
 
     def _on_open_project(self) -> None:
-        self._toast(tr("msg_menu_stub"), "info")
+        from PySide6.QtWidgets import QFileDialog
+        path, _sel = QFileDialog.getOpenFileName(
+            self, tr("dlg_open_project"), "", "AI Studio project (*.json)")
+        if not path:
+            return
+        try:
+            self.load_project_from(path)
+        except Exception as e:
+            self._toast(f'{tr("proj_fail")}\n{type(e).__name__}: {e}', "error")
+            return
+        self._toast(f'{tr("proj_loaded")} {path}', "success")
+        self._resource_bar.set_message(f'{tr("proj_loaded")} {path}')
 
     def _on_save_project(self) -> None:
-        self._toast(tr("msg_menu_stub"), "info")
+        from PySide6.QtWidgets import QFileDialog
+        path, _sel = QFileDialog.getSaveFileName(
+            self, tr("dlg_save_project"), "project.json",
+            "AI Studio project (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            self.save_project_to(path)
+        except Exception as e:
+            self._toast(f'{tr("proj_fail")}\n{type(e).__name__}: {e}', "error")
+            return
+        self._toast(f'{tr("proj_saved")} {path}', "success")
+        self._resource_bar.set_message(f'{tr("proj_saved")} {path}')
 
     def _on_export(self) -> None:
         """Реальный экспорт последнего сгенерированного аудио."""
@@ -408,10 +551,13 @@ class MainWindow(QMainWindow):
         self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
 
     def _on_manage_models(self) -> None:
-        self._toast(tr("msg_menu_stub"), "info")
+        # Поднимаем реальный Model Hub dock и обновляем скан
+        self._model_hub.show()
+        self._model_hub.raise_()
+        self._model_ctrl.refresh()
 
     def _on_download_model(self) -> None:
-        dlg = ModelDownloadDialog(self)
+        dlg = ModelDownloadDialog(self._model_ctrl, self)
         dlg.exec()
 
     def _on_env_wizard(self) -> None:
