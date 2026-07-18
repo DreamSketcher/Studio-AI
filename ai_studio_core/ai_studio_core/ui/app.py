@@ -4,11 +4,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QTextStream, Qt
+from PySide6.QtCore import QFile, QSettings, QTextStream, Qt
 from PySide6.QtWidgets import QApplication
+
+from ai_studio_core import i18n
 
 from .main_window import MainWindow
 from .theme.palette import make_dark_palette
+
+_LANGUAGE_KEY = "ui/language"
 
 
 def run() -> int:
@@ -20,6 +24,11 @@ def run() -> int:
     app.setApplicationName("AI Studio")
     app.setOrganizationName("ai_studio")
     app.setApplicationVersion("0.1.0")
+
+    # Язык интерфейса восстанавливаем до построения виджетов
+    saved_lang = QSettings("ai_studio", "studio").value(_LANGUAGE_KEY, None)
+    if saved_lang:
+        i18n.set_language(str(saved_lang))
 
     # Тема
     app.setPalette(make_dark_palette())

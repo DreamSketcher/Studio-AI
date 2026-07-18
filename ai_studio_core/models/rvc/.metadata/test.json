@@ -1,0 +1,8 @@
+{
+  "id": "test",
+  "name": "Test Model",
+  "url": "https://example.com/model.pth",
+  "filename": "test.pth",
+  "downloadable": true,
+  "local_name": "test"
+}

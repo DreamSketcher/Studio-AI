@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from ai_studio_core.i18n import t as tr
+
 from ..theme.tokens import TOKENS
 
 
@@ -25,11 +27,11 @@ class HistoryPanel(QWidget):
 
         filter_row = QHBoxLayout()
         self._type_filter = QComboBox()
-        self._type_filter.addItems(["All", "TTS", "Chat", "Image"])
-        self._type_filter.setFixedWidth(80)
+        self._type_filter.addItems([tr("hist_all"), "TTS", "Chat", "Image"])
+        self._type_filter.setFixedWidth(90)
         filter_row.addWidget(self._type_filter)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search history…")
+        self._search.setPlaceholderText(tr("hist_search_ph"))
         filter_row.addWidget(self._search)
         layout.addLayout(filter_row)
 
@@ -49,3 +51,7 @@ class HistoryPanel(QWidget):
         ]:
             self._list.addItem(QListWidgetItem(f"{type_}  {text}\n     {time}"))
         layout.addWidget(self._list, stretch=1)
+
+    def retranslate_ui(self) -> None:
+        self._type_filter.setItemText(0, tr("hist_all"))
+        self._search.setPlaceholderText(tr("hist_search_ph"))

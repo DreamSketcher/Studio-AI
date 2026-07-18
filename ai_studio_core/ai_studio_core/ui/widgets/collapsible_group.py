@@ -41,6 +41,7 @@ class CollapsibleGroup(QWidget):
             f"font-weight: 600; text-transform: uppercase; letter-spacing: 1px; "
             f"border: none;"
         )
+        self._title_label = title_label
         header_layout.addWidget(title_label)
         header_layout.addStretch()
 
@@ -80,6 +81,12 @@ class CollapsibleGroup(QWidget):
 
     def is_expanded(self) -> bool:
         return self._expanded
+
+    def set_title(self, title: str) -> None:
+        self._title_label.setText(title)
+
+    def title(self) -> str:
+        return self._title_label.text()
 
     def content_widget(self) -> QWidget:
         return self._content

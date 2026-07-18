@@ -23,18 +23,28 @@ class PipelineStrip(QWidget):
             f"background: {TOKENS.colors.bg_secondary}; "
             f"border-top: 1px solid {TOKENS.colors.border_default};"
         )
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(
+        self._step_labels: list[QLabel] = []
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(
             TOKENS.spacing.lg, TOKENS.spacing.xs,
             TOKENS.spacing.lg, TOKENS.spacing.xs,
         )
-        layout.setSpacing(0)
+        self._layout.setSpacing(0)
+        self._populate(steps)
 
-        self._step_labels: list[QLabel] = []
+    def _populate(self, steps: list[str]) -> None:
+        """Строит/перестраивает полоску этапов (используется и при смене языка)."""
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._step_labels.clear()
+
+        layout = self._layout
+
         for i, step_name in enumerate(steps):
             if i > 0:
-                arrow = QLabel("  ──→  ")
+                arrow = QLabel(" → ")
                 arrow.setStyleSheet(
                     f"color: {TOKENS.colors.pipeline_connector}; "
                     f"font-size: {TOKENS.font_size.caption}px; "
@@ -42,13 +52,20 @@ class PipelineStrip(QWidget):
                 )
                 layout.addWidget(arrow)
 
-            label = QLabel(f"  {step_name}  ")
+            label = QLabel(step_name)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._apply_step_style(label, "idle")
             layout.addWidget(label)
             self._step_labels.append(label)
 
         layout.addStretch()
+
+    def set_steps(self, steps: list[str]) -> None:
+        """Перестраивает полоску под новый набор этапов (например, смена языка)."""
+        self._populate(steps)
+
+    def steps(self) -> list[str]:
+        return [lbl.text().strip() for lbl in self._step_labels]
 
     def set_step_state(self, index: int, state: str) -> None:
         if 0 <= index < len(self._step_labels):

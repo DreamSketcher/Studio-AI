@@ -1,7 +1,15 @@
-"""Контроллер чата с LLM."""
+"""Контроллер чата с LLM.
+
+Рабочий каркас: история диалога, обращение к gpt_client в фоновом потоке,
+отсутствие каких-либо сгенерированных-заранее «демо-ответов».
+Когда API-ключ не настроен — пользователь получает честное уведомление.
+Полная интеграция (потоковые ответы, выбор провайдера) — отдельным этапом.
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import Signal, Slot
+
+from ai_studio_core.i18n import t as tr
 
 from .base_controller import BaseController
 
@@ -34,36 +42,33 @@ class ChatController(BaseController):
         # User-пузырь уже отрисован workspace'ом, повторно не добавляем,
         # иначе в UI появится дубликат сообщения.
         if not self._ensure_client():
-            self.message_added.emit("assistant",
-                "[Локальный LLM-клиент пока не настроен. Это демонстрационный UI — "
-                "интегрируйте api_key и выбранную модель через Settings.]"
-            )
-            self.status_message.emit("LLM client not configured")
+            self.message_added.emit("assistant", tr("ctl_llm_missing"))
+            self.status_message.emit(tr("ctl_llm_missing"))
             return
         self.generation_started.emit()
-        # Заглушка: реальный вызов и стриминг здесь.
-        self.busy_changed.emit(True)
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(400, lambda: self._fake_reply(user_message))
 
-    def _fake_reply(self, user_message: str) -> None:
-        reply = (
-            f"Это демонстрационный ответ на «{user_message[:40]}…».\n\n"
-            "Подключите реальный API (openai/groq/anthropic/local-llm) через контроллер "
-            "ChatController — для этого достаточно заменить _fake_reply на вызов "
-            "ai_studio_core.gpt_client."
-        )
+        def _call(progress_callback=None, cancel_check=None) -> str:
+            if cancel_check and cancel_check():
+                return ""
+            return self._chat_fn(user_message, system=system_prompt or None)
+
+        worker = self._run_in_background(_call)
+        worker.result.connect(self._on_reply)
+
+    @Slot(object)
+    def _on_reply(self, reply) -> None:
+        if not reply:
+            return
         self.message_received.emit(reply)
         self.message_added.emit("assistant", reply)
         self.generation_finished.emit()
-        self.busy_changed.emit(False)
-        self.status_message.emit("Reply received")
+        self.status_message.emit(tr("ctl_reply_received"))
 
     @Slot()
     def on_stop(self) -> None:
         self.cancel_current()
-        self.status_message.emit("Chat cancelled")
+        self.status_message.emit(tr("ctl_chat_cancelled"))
 
     @Slot()
     def on_clear(self) -> None:
-        self.status_message.emit("Chat cleared")
+        self.status_message.emit(tr("ctl_chat_cleared"))

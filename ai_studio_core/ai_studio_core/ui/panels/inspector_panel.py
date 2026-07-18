@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QFormLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget,
 )
 
+from ai_studio_core.i18n import t as tr
+
 from ..theme.tokens import TOKENS
 
 
@@ -28,7 +30,7 @@ class InspectorPanel(QWidget):
         )
 
         # Ключ-свойство строки обновляются через show_item()
-        self._title = QLabel("Nothing selected")
+        self._title = QLabel(tr("insp_nothing"))
         self._title.setStyleSheet(
             f"color: {TOKENS.colors.text_primary}; "
             f"font-size: {TOKENS.font_size.subtitle}px; font-weight: 600;"
@@ -51,8 +53,13 @@ class InspectorPanel(QWidget):
 
         self._details = QPlainTextEdit()
         self._details.setReadOnly(True)
-        self._details.setPlaceholderText("Details / metadata…")
+        self._details.setPlaceholderText(tr("insp_details_ph"))
         layout.addWidget(self._details, stretch=1)
+
+    def retranslate_ui(self) -> None:
+        if not self._type.text():
+            self._title.setText(tr("insp_nothing"))
+        self._details.setPlaceholderText(tr("insp_details_ph"))
 
     # ── Public API (будущая интеграция) ──
 

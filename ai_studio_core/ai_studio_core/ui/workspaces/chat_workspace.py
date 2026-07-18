@@ -1,12 +1,14 @@
-"""Chat Workspace — чат с LLM."""
+"""Chat Workspace — чат с LLM. Строки через i18n, retranslate_ui() без пересоздания."""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QScrollArea,
-    QSizePolicy, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QComboBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QPlainTextEdit, QScrollArea, QSizePolicy, QSlider, QToolBar,
+    QToolButton, QVBoxLayout, QWidget,
 )
+
+from ai_studio_core.i18n import t as tr
 
 from ..theme.tokens import TOKENS
 from ..widgets.collapsible_group import CollapsibleGroup
@@ -45,6 +47,9 @@ class ChatBubble(QFrame):
         content_label.setStyleSheet(f"border: none;")
         layout.addWidget(content_label)
 
+        self._role_label = role_label
+        self._content_label = content_label
+
 
 class ChatWorkspace(BaseWorkspace):
     send_requested = Signal(str, str, str, float)  # (message, system, model, temperature)
@@ -55,7 +60,10 @@ class ChatWorkspace(BaseWorkspace):
         return "chat"
 
     def _pipeline_steps(self) -> list[str]:
-        return ["User", "System+Context", "LLM API", "Stream", "Response"]
+        return [
+            tr("step_user"), tr("step_sysctx"), tr("step_llm_api"),
+            tr("step_stream"), tr("step_response"),
+        ]
 
     def _build_toolbar(self) -> QToolBar:
         tb = QToolBar()
@@ -65,34 +73,33 @@ class ChatWorkspace(BaseWorkspace):
             f"border-bottom: 1px solid {TOKENS.colors.border_default}; "
             f"padding: {TOKENS.spacing.sm}px; spacing: {TOKENS.spacing.sm}px; }}"
         )
-        lbl = QLabel(" Model: ")
-        lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
-        tb.addWidget(lbl)
+        self._model_lbl = QLabel(tr("chat_model"))
+        self._model_lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
+        tb.addWidget(self._model_lbl)
         self._model_selector = ModelSelector(category="llm", placeholder="Select LLM…")
         tb.addWidget(self._model_selector)
         tb.addSeparator()
 
-        lbl_t = QLabel(" Temp: ")
-        lbl_t.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
-        tb.addWidget(lbl_t)
-        from PySide6.QtWidgets import QSlider
+        self._temp_lbl = QLabel(tr("chat_temp"))
+        self._temp_lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
+        tb.addWidget(self._temp_lbl)
         self._temp_slider = QSlider(Qt.Orientation.Horizontal)
         self._temp_slider.setRange(0, 200)
         self._temp_slider.setValue(70)
         self._temp_slider.setFixedWidth(120)
         tb.addWidget(self._temp_slider)
-        self._temp_label = QLabel("0.70")
-        self._temp_label.setFixedWidth(40)
-        self._temp_label.setStyleSheet(f"color: {TOKENS.colors.accent_secondary}; border: none;")
-        self._temp_slider.valueChanged.connect(lambda v: self._temp_label.setText(f"{v/100:.2f}"))
-        tb.addWidget(self._temp_label)
+        self._temp_value = QLabel("0.70")
+        self._temp_value.setFixedWidth(40)
+        self._temp_value.setStyleSheet(f"color: {TOKENS.colors.accent_secondary}; border: none;")
+        self._temp_slider.valueChanged.connect(lambda v: self._temp_value.setText(f"{v/100:.2f}"))
+        tb.addWidget(self._temp_value)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
         self._btn_clear = QToolButton()
-        self._btn_clear.setText("🗑  Clear")
+        self._btn_clear.setText(tr("chat_clear"))
         self._btn_clear.clicked.connect(self._on_clear)
         tb.addWidget(self._btn_clear)
 
@@ -108,6 +115,7 @@ class ChatWorkspace(BaseWorkspace):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self._scroll = scroll
 
         self._chat_container = QWidget()
         self._chat_layout = QVBoxLayout(self._chat_container)
@@ -118,9 +126,9 @@ class ChatWorkspace(BaseWorkspace):
             TOKENS.spacing.lg, TOKENS.spacing.lg,
         )
 
-        self._chat_layout.addWidget(
-            ChatBubble("assistant", "Hello! How can I help you today?")
-        )
+        # Приветственное сообщение (переводится вместе с языком)
+        self._greeting_bubble = ChatBubble("assistant", tr("chat_greeting"))
+        self._chat_layout.addWidget(self._greeting_bubble)
 
         scroll.setWidget(self._chat_container)
         layout.addWidget(scroll, stretch=1)
@@ -137,7 +145,7 @@ class ChatWorkspace(BaseWorkspace):
             TOKENS.spacing.lg, TOKENS.spacing.sm,
         )
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Type a message…")
+        self._input.setPlaceholderText(tr("chat_input_ph"))
         self._input.setMinimumHeight(40)
         self._input.returnPressed.connect(self._on_send)
         bl.addWidget(self._input, stretch=1)
@@ -165,45 +173,81 @@ class ChatWorkspace(BaseWorkspace):
             TOKENS.spacing.lg, TOKENS.spacing.lg,
         )
 
-        sys_group = CollapsibleGroup("System Prompt", expanded=True)
+        self._sys_group = CollapsibleGroup(tr("chat_sys_block"), expanded=True)
         sys_layout = QVBoxLayout()
         self._system_prompt = QPlainTextEdit()
-        self._system_prompt.setPlaceholderText("You are a helpful assistant…")
+        self._system_prompt.setPlaceholderText(tr("chat_sys_ph"))
         self._system_prompt.setMaximumHeight(200)
         sys_layout.addWidget(self._system_prompt)
-        sys_group.set_content_layout(sys_layout)
-        layout.addWidget(sys_group)
+        self._sys_group.set_content_layout(sys_layout)
+        layout.addWidget(self._sys_group)
 
-        param_group = CollapsibleGroup("Parameters")
-        from PySide6.QtWidgets import QFormLayout, QComboBox
+        self._param_group = CollapsibleGroup(tr("chat_params"))
         pf = QFormLayout()
         self._max_tokens = QComboBox()
         self._max_tokens.addItems(["256", "512", "1024", "2048", "4096", "8192"])
         self._max_tokens.setCurrentText("4096")
-        pf.addRow("Max tokens:", self._max_tokens)
-        param_group.set_content_layout(pf)
-        layout.addWidget(param_group)
+        self._max_tokens_lbl = QLabel(tr("chat_max_tokens"))
+        pf.addRow(self._max_tokens_lbl, self._max_tokens)
+        self._param_group.set_content_layout(pf)
+        layout.addWidget(self._param_group)
 
-        ctx_group = CollapsibleGroup("Context")
-        from PySide6.QtWidgets import QFormLayout
+        self._ctx_group = CollapsibleGroup(tr("chat_context"))
         cf = QVBoxLayout()
-        self._ctx_tokens = QLabel("Tokens: 0 / 128k")
-        self._ctx_cost = QLabel("Estimated cost: $0.000")
+        self._ctx_tokens = QLabel()
+        self._ctx_cost = QLabel()
         cf.addWidget(self._ctx_tokens)
         cf.addWidget(self._ctx_cost)
-        ctx_group.set_content_layout(cf)
-        layout.addWidget(ctx_group)
+        self._ctx_group.set_content_layout(cf)
+        layout.addWidget(self._ctx_group)
 
         layout.addStretch()
+        self._update_context_labels()
         return sidebar
+
+    # ── i18n ──
+
+    def retranslate_ui(self) -> None:
+        self._model_lbl.setText(tr("chat_model"))
+        self._temp_lbl.setText(tr("chat_temp"))
+        self._btn_clear.setText(tr("chat_clear"))
+        self._input.setPlaceholderText(tr("chat_input_ph"))
+        self._sys_group.set_title(tr("chat_sys_block"))
+        self._system_prompt.setPlaceholderText(tr("chat_sys_ph"))
+        self._param_group.set_title(tr("chat_params"))
+        self._max_tokens_lbl.setText(tr("chat_max_tokens"))
+        self._ctx_group.set_title(tr("chat_context"))
+        self._greeting_bubble._content_label.setText(tr("chat_greeting"))
+        self._update_context_labels()
+        if self._pipeline_strip is not None:
+            self._pipeline_strip.set_steps(self._pipeline_steps())
+
+    def _update_context_labels(self) -> None:
+        n = len(self._collect_history())
+        self._ctx_tokens.setText(f'{tr("chat_tokens_lbl")} ~{n * 20} / 128k')
+        self._ctx_cost.setText(f'{tr("chat_cost_lbl")} $0.000')
+
+    # ── Behavior ──
+
+    def _collect_history(self) -> list[dict]:
+        """История в формате [{'role':..., 'content':...}] из текущих пузырей."""
+        history = []
+        for i in range(self._chat_layout.count()):
+            w = self._chat_layout.itemAt(i).widget()
+            if isinstance(w, ChatBubble):
+                history.append({
+                    "role": w._role_label.text().lower(),
+                    "content": w._content_label.text(),
+                })
+        return history
 
     def _on_send(self) -> None:
         text = self._input.text().strip()
         if not text:
             return
-        bubble = ChatBubble("user", text)
-        self._chat_layout.addWidget(bubble)
+        self._chat_layout.addWidget(ChatBubble("user", text))
         self._input.clear()
+        self._update_context_labels()
         self.send_requested.emit(
             text,
             self._system_prompt.toPlainText(),
@@ -216,10 +260,18 @@ class ChatWorkspace(BaseWorkspace):
             item = self._chat_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._greeting_bubble = ChatBubble("assistant", tr("chat_greeting"))
+        self._chat_layout.addWidget(self._greeting_bubble)
+        self._update_context_labels()
         self.clear_requested.emit()
 
     def add_message(self, role: str, content: str) -> None:
         self._chat_layout.addWidget(ChatBubble(role, content))
+        self._update_context_labels()
+        # Автоскролл вниз
+        sb = self._scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def set_busy(self, busy: bool) -> None:
         self._btn_send.setEnabled(not busy)
+        self._input.setEnabled(not busy)

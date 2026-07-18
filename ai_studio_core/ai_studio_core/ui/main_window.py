@@ -4,7 +4,7 @@ Layout:
 ┌──────────────────────────────────────────────────┐
 │  Menu Bar                                        │
 ├──────────────────────────────────────────────────┤
-│  [TTS]  [Chat]  [Image]  [Pipeline]    (tabs)   │
+│  [TTS]  [Chat]  [Image]  [Pipeline]    (tabs)    │
 ├────────┬─────────────────────────┬───────────────┤
 │        │                         │               │
 │ Model  │   Active Workspace      │   Settings    │
@@ -15,14 +15,19 @@ Layout:
 ├──────────────────────────────────────────────────┤
 │  Status: GPU% │ VRAM │ CPU% │ Queue size         │
 └──────────────────────────────────────────────────┘
+
+Язык интерфейса переключается на лету (Settings → Language → retranslate).
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QByteArray, QSettings, Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QDockWidget, QMainWindow, QMenuBar, QTabWidget, QWidget,
+    QDockWidget, QMainWindow, QTabWidget, QWidget,
 )
+
+from ai_studio_core import i18n
+from ai_studio_core.i18n import t as tr
 
 from .controllers import (
     ChatController, ModelController, QueueController, TTSController,
@@ -42,6 +47,7 @@ from .workspaces import (
 class MainWindow(QMainWindow):
     _WINDOW_GEOMETRY_KEY = "mainwindow/geometry"
     _WINDOW_STATE_KEY = "mainwindow/state"
+    _LANGUAGE_KEY = "ui/language"
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -51,54 +57,80 @@ class MainWindow(QMainWindow):
 
         self._settings = QSettings("ai_studio", "studio")
 
+        # Язык восстанавливаем ДО построения виджетов (app.py уже применил его,
+        # но повторная установка idempotent и спасает при прямом создании окна)
+        saved_lang = self._settings.value(self._LANGUAGE_KEY, None)
+        if saved_lang:
+            i18n.set_language(str(saved_lang))
+
         # Контроллеры
         self._tts_ctrl = TTSController()
         self._chat_ctrl = ChatController()
         self._model_ctrl = ModelController()
         self._queue_ctrl = QueueController()
 
+        self._menu_map: list[tuple[object, str]] = []   # (QMenu, i18n key)
+        self._action_map: list[tuple[QAction, str]] = []
+        self._dock_map: list[tuple[QDockWidget, str]] = []
+        self._tab_map: list[tuple[int, str]] = []
+
         self._setup_menu_bar()
         self._setup_workspaces()
         self._setup_dock_panels()
         self._setup_status_bar()
         self._wire_controllers()
+        self._wire_settings()
         self._restore_layout()
 
-        # Стартовый toast
-        QTimer = None
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(300, lambda: self._toast("Добро пожаловать в AI Studio", "info"))
+        QTimer.singleShot(300, lambda: self._toast(tr("msg_welcome"), "info"))
 
     # ── Menu ──
     def _setup_menu_bar(self) -> None:
         menu_bar = self.menuBar()
 
-        file_menu = menu_bar.addMenu("&File")
-        file_menu.addAction(self._make_action("New Project", "Ctrl+N", self._noop))
-        file_menu.addAction(self._make_action("Open Project…", "Ctrl+O", self._noop))
+        file_menu = menu_bar.addMenu("")
+        self._menu_map.append((file_menu, "menu_file"))
+        self._add_menu_action(file_menu, "act_new_project", "Ctrl+N", self._on_new_project)
+        self._add_menu_action(file_menu, "act_open_project", "Ctrl+O", self._on_open_project)
+        self._add_menu_action(file_menu, "act_save_project", "Ctrl+S", self._on_save_project)
         file_menu.addSeparator()
-        file_menu.addAction(self._make_action("Export…", "Ctrl+Shift+E", self._noop))
+        self._add_menu_action(file_menu, "act_export", "Ctrl+Shift+E", self._on_export)
         file_menu.addSeparator()
-        file_menu.addAction(self._make_action("Exit", "Ctrl+Q", self.close))
+        self._add_menu_action(file_menu, "act_exit", "Ctrl+Q", self.close)
 
-        self._view_menu = menu_bar.addMenu("&View")
+        self._view_menu = menu_bar.addMenu("")
+        self._menu_map.append((self._view_menu, "menu_view"))
 
-        models_menu = menu_bar.addMenu("&Models")
-        models_menu.addAction(self._make_action("Download Model…", "", self._on_download_model))
-        models_menu.addAction(self._make_action("Manage Models…", "", self._noop))
+        models_menu = menu_bar.addMenu("")
+        self._menu_map.append((models_menu, "menu_models"))
+        self._add_menu_action(models_menu, "act_download_model", "", self._on_download_model)
+        self._add_menu_action(models_menu, "act_manage_models", "", self._on_manage_models)
 
-        tools_menu = menu_bar.addMenu("&Tools")
-        tools_menu.addAction(self._make_action("Environment Setup Wizard…", "", self._on_env_wizard))
+        tools_menu = menu_bar.addMenu("")
+        self._menu_map.append((tools_menu, "menu_tools"))
+        self._add_menu_action(tools_menu, "act_env_wizard", "", self._on_env_wizard)
 
-        help_menu = menu_bar.addMenu("&Help")
-        help_menu.addAction(self._make_action("About", "", self._on_about))
+        help_menu = menu_bar.addMenu("")
+        self._menu_map.append((help_menu, "menu_help"))
+        self._add_menu_action(help_menu, "act_about", "", self._on_about)
 
-    def _make_action(self, text: str, shortcut: str, slot) -> QAction:
-        a = QAction(text, self)
+        self.retranslate_menus()
+
+    def _add_menu_action(self, menu, key: str, shortcut: str, slot) -> QAction:
+        a = QAction("", self)
         if shortcut:
             a.setShortcut(QKeySequence(shortcut))
         a.triggered.connect(slot)
+        menu.addAction(a)
+        self._action_map.append((a, key))
         return a
+
+    def retranslate_menus(self) -> None:
+        for menu, key in self._menu_map:
+            menu.setTitle(tr(key))
+        for action, key in self._action_map:
+            action.setText(tr(key))
 
     # ── Workspaces ──
     def _setup_workspaces(self) -> None:
@@ -112,36 +144,42 @@ class MainWindow(QMainWindow):
         self._image_workspace = ImageWorkspace()
         self._pipeline_workspace = PipelineWorkspace()
 
-        self._workspace_tabs.addTab(self._tts_workspace, "🎙  TTS")
-        self._workspace_tabs.addTab(self._chat_workspace, "💬  Chat")
-        self._workspace_tabs.addTab(self._image_workspace, "🖼  Image")
-        self._workspace_tabs.addTab(self._pipeline_workspace, "🔗  Pipeline")
+        self._tab_map = []
+        self._add_workspace_tab(self._tts_workspace, "tab_tts")
+        self._add_workspace_tab(self._chat_workspace, "tab_chat")
+        self._add_workspace_tab(self._image_workspace, "tab_image")
+        self._add_workspace_tab(self._pipeline_workspace, "tab_pipeline")
 
         self.setCentralWidget(self._workspace_tabs)
+
+    def _add_workspace_tab(self, widget: QWidget, key: str) -> None:
+        idx = self._workspace_tabs.addTab(widget, tr(key))
+        self._tab_map.append((idx, key))
 
     # ── Dock panels ──
     def _setup_dock_panels(self) -> None:
         self._model_hub = self._create_dock(
-            "Model Hub", ModelHubPanel(), Qt.DockWidgetArea.LeftDockWidgetArea
+            "dock_model_hub", ModelHubPanel(), Qt.DockWidgetArea.LeftDockWidgetArea
         )
         self._settings_dock = self._create_dock(
-            "Settings", SettingsPanel(), Qt.DockWidgetArea.RightDockWidgetArea
+            "dock_settings", SettingsPanel(), Qt.DockWidgetArea.RightDockWidgetArea
         )
         self._inspector_dock = self._create_dock(
-            "Inspector", InspectorPanel(), Qt.DockWidgetArea.RightDockWidgetArea
+            "dock_inspector", InspectorPanel(), Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.tabifyDockWidget(self._settings_dock, self._inspector_dock)
         self._settings_dock.raise_()
+
         self._queue_dock = self._create_dock(
-            "Queue", QueuePanel(), Qt.DockWidgetArea.BottomDockWidgetArea
+            "dock_queue", QueuePanel(), Qt.DockWidgetArea.BottomDockWidgetArea
         )
         self._log_dock = self._create_dock(
-            "Console", LogConsole(), Qt.DockWidgetArea.BottomDockWidgetArea
+            "dock_console", LogConsole(), Qt.DockWidgetArea.BottomDockWidgetArea
         )
         self.tabifyDockWidget(self._queue_dock, self._log_dock)
 
         self._history_dock = self._create_dock(
-            "History", HistoryPanel(), Qt.DockWidgetArea.LeftDockWidgetArea
+            "dock_history", HistoryPanel(), Qt.DockWidgetArea.LeftDockWidgetArea
         )
         self.tabifyDockWidget(self._model_hub, self._history_dock)
         self._model_hub.raise_()
@@ -150,10 +188,13 @@ class MainWindow(QMainWindow):
         self._queue_widget = self._queue_dock.widget()
         self._history_widget = self._history_dock.widget()
         self._model_widget = self._model_hub.widget()
+        self._settings_widget = self._settings_dock.widget()
+        self._inspector_widget = self._inspector_dock.widget()
         self._log_widget = self._log_dock.widget()
 
-    def _create_dock(self, title: str, widget: QWidget, area: Qt.DockWidgetArea) -> QDockWidget:
-        dock = QDockWidget(title, self)
+    def _create_dock(self, title_key: str, widget: QWidget, area: Qt.DockWidgetArea) -> QDockWidget:
+        dock = QDockWidget(tr(title_key), self)
+        dock.setObjectName(f"dock_{title_key}")  # обязателен для saveState()
         dock.setWidget(widget)
         dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea
@@ -161,6 +202,7 @@ class MainWindow(QMainWindow):
             | Qt.DockWidgetArea.BottomDockWidgetArea
         )
         self.addDockWidget(area, dock)
+        self._dock_map.append((dock, title_key))
         if hasattr(self, "_view_menu") and self._view_menu is not None:
             self._view_menu.addAction(dock.toggleViewAction())
         return dock
@@ -169,7 +211,49 @@ class MainWindow(QMainWindow):
     def _setup_status_bar(self) -> None:
         self._resource_bar = ResourceStatusBar()
         self.setStatusBar(self._resource_bar)
-        self._resource_bar.set_message("Ready")
+        self._resource_bar.set_message(tr("msg_ready"))
+
+    # ── Settings → language/theme/paths ──
+    def _wire_settings(self) -> None:
+        sp = self._settings_widget
+        # Комбоксокс показывает текущий язык (без эмиссии)
+        sp.set_language(i18n.get_language())
+        sp.language_changed.connect(self._on_language_changed)
+        sp.settings_changed.connect(self._on_settings_changed)
+        sp.paths_changed.connect(self._on_paths_changed)
+
+    def _on_language_changed(self, code: str) -> None:
+        if not i18n.set_language(code):
+            return
+        self._settings.setValue(self._LANGUAGE_KEY, code)
+        self.retranslate_ui()
+        # Подписи провайдеров в gpt_client тоже зависят от языка
+        try:
+            from ai_studio_core import gpt_client
+            gpt_client.refresh_i18n_labels()
+        except Exception:
+            pass
+        self._log_widget.append("INFO", f"Language switched: {code}")
+
+    def _on_settings_changed(self, settings: dict) -> None:
+        self._app_settings = settings
+
+    def _on_paths_changed(self, kind: str, path: str) -> None:
+        self._log_widget.append("INFO", f"Path changed: {kind} -> {path}")
+
+    def retranslate_ui(self) -> None:
+        """Живое переключение языка без пересоздания виджетов."""
+        self.retranslate_menus()
+        for idx, key in self._tab_map:
+            self._workspace_tabs.setTabText(idx, tr(key))
+        for dock, key in self._dock_map:
+            dock.setWindowTitle(tr(key))
+        for ws in (self._tts_workspace, self._chat_workspace,
+                   self._image_workspace, self._pipeline_workspace):
+            ws.retranslate_ui()
+        for panel in (self._settings_widget, self._inspector_widget,
+                      self._model_widget, self._history_widget, self._queue_widget):
+            panel.retranslate_ui()
 
     # ── Wiring controllers <→ UI ──
     def _wire_controllers(self) -> None:
@@ -178,12 +262,7 @@ class MainWindow(QMainWindow):
         self._tts_workspace.stop_requested.connect(self._tts_ctrl.on_stop)
         self._tts_ctrl.busy_changed.connect(self._tts_workspace.set_busy)
         self._tts_ctrl.status_message.connect(self._resource_bar.set_message)
-        self._tts_ctrl.generation_progress.connect(
-            lambda pct, _s: self._tts_workspace.pipeline().set_step_state(3, "active") if self._tts_workspace.pipeline() else None
-        )
-        self._tts_ctrl.pipeline_step_changed.connect(
-            lambda idx, state: self._tts_workspace.pipeline().set_step_state(idx, state) if self._tts_workspace.pipeline() else None
-        )
+        self._tts_ctrl.pipeline_step_changed.connect(self._on_tts_step)
         self._tts_ctrl.generation_complete.connect(self._on_tts_done)
         self._tts_ctrl.log_message.connect(self._log_widget.append)
         self._tts_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
@@ -200,6 +279,7 @@ class MainWindow(QMainWindow):
 
         # Model hub
         self._model_widget.download_requested.connect(self._model_ctrl.download_model)
+        self._model_widget.delete_requested.connect(self._model_ctrl.delete_model)
         self._model_ctrl.status_message.connect(self._resource_bar.set_message)
         self._model_ctrl.log_message.connect(self._log_widget.append)
 
@@ -209,9 +289,14 @@ class MainWindow(QMainWindow):
         self._queue_ctrl.queue_changed.connect(self._queue_widget.set_tasks)
         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
 
+    def _on_tts_step(self, idx: int, state: str) -> None:
+        strip = self._tts_workspace.pipeline()
+        if strip is not None:
+            strip.set_step_state(idx, state)
+
     def _on_tts_done(self, output_path: str) -> None:
-        self._resource_bar.set_message(f"Generated: {output_path}")
-        self._toast(f"Generation complete\n{output_path}", "success")
+        self._resource_bar.set_message(f'{tr("msg_generation_complete")}: {output_path}')
+        self._toast(f'{tr("msg_generation_complete")}\n{output_path}', "success")
 
     # ── Layout persistence ──
     def _restore_layout(self) -> None:
@@ -227,9 +312,21 @@ class MainWindow(QMainWindow):
         self._settings.setValue(self._WINDOW_STATE_KEY, self.saveState())
         super().closeEvent(event)
 
-    # ── Menu slots ──
-    def _noop(self) -> None:
-        self._toast("Этот пункт меню — заглушка в демо UI", "info")
+    # ── Menu slots (реальные реализации подключаются поэтапно) ──
+    def _on_new_project(self) -> None:
+        self._toast(tr("msg_menu_stub"), "info")
+
+    def _on_open_project(self) -> None:
+        self._toast(tr("msg_menu_stub"), "info")
+
+    def _on_save_project(self) -> None:
+        self._toast(tr("msg_menu_stub"), "info")
+
+    def _on_export(self) -> None:
+        self._toast(tr("msg_menu_stub"), "info")
+
+    def _on_manage_models(self) -> None:
+        self._toast(tr("msg_menu_stub"), "info")
 
     def _on_download_model(self) -> None:
         dlg = ModelDownloadDialog(self)
@@ -244,5 +341,5 @@ class MainWindow(QMainWindow):
 
     # ── Toast helper ──
     def _toast(self, message: str, variant: str = "info") -> None:
-        t = Toast(message, variant=variant, duration_ms=3000, parent=self)
-        t.show_at(self)
+        t_ = Toast(message, variant=variant, duration_ms=3000, parent=self)
+        t_.show_at(self)

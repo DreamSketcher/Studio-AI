@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ai_studio_core.i18n import t as tr
+
 from ..controllers.queue_controller import QueueTask
 from ..theme.tokens import TOKENS
 
@@ -22,7 +24,7 @@ class QueuePanel(QWidget):
         layout.setSpacing(0)
 
         self._table = QTableWidget(0, 5)
-        self._table.setHorizontalHeaderLabels(["Status", "Type", "Model", "Progress", "Actions"])
+        self._apply_headers()
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self._table.verticalHeader().setVisible(False)
@@ -43,10 +45,20 @@ class QueuePanel(QWidget):
         bar.setContentsMargins(TOKENS.spacing.sm, TOKENS.spacing.xs,
                                TOKENS.spacing.sm, TOKENS.spacing.xs)
         bar.addStretch()
-        btn_clear = QPushButton("Clear Completed")
-        btn_clear.clicked.connect(self.clear_completed.emit)
-        bar.addWidget(btn_clear)
+        self._btn_clear = QPushButton(tr("queue_clear_done"))
+        self._btn_clear.clicked.connect(self.clear_completed.emit)
+        bar.addWidget(self._btn_clear)
         layout.addLayout(bar)
+
+    def _apply_headers(self) -> None:
+        self._table.setHorizontalHeaderLabels([
+            tr("queue_status"), tr("queue_type"), tr("queue_model"),
+            tr("queue_progress"), tr("queue_actions"),
+        ])
+
+    def retranslate_ui(self) -> None:
+        self._apply_headers()
+        self._btn_clear.setText(tr("queue_clear_done"))
 
     def set_tasks(self, tasks: list[QueueTask]) -> None:
         self._table.setRowCount(0)

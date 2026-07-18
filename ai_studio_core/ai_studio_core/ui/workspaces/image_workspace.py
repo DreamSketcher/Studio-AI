@@ -1,7 +1,7 @@
-"""Image Workspace — генерация изображений (заглушка).
+"""Image Workspace — генерация изображений.
 
-По blueprint UI-слоя этот workspace заявлен как заглушка: разметка есть,
-интеграция с image-движком появится позже через контроллер.
+Бэкенд изображений (diffusers/API) подключается через ImageController;
+workspace только собирает параметры и эмитит сигналы. Строки — через i18n.
 """
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from ai_studio_core.i18n import t as tr
+
 from ..theme.tokens import TOKENS
 from ..widgets.collapsible_group import CollapsibleGroup
 from ..widgets.model_selector import ModelSelector
@@ -20,7 +22,7 @@ from .base_workspace import BaseWorkspace
 
 
 def _slider_row(label_text: str, min_val: int, max_val: int, default: int,
-                fmt: str = "{}") -> tuple[QWidget, QSlider]:
+                scale: float = 1.0, fmt: str = "{}") -> tuple[QWidget, QSlider, QLabel, QLabel]:
     row = QWidget()
     h = QHBoxLayout(row)
     h.setContentsMargins(0, 2, 0, 2)
@@ -31,14 +33,26 @@ def _slider_row(label_text: str, min_val: int, max_val: int, default: int,
     slider = QSlider(Qt.Orientation.Horizontal)
     slider.setRange(min_val, max_val)
     slider.setValue(default)
-    val = QLabel(fmt.format(default))
+    val = QLabel(fmt.format(default / scale))
     val.setFixedWidth(48)
     val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     val.setStyleSheet(f"color: {TOKENS.colors.accent_secondary}; border: none;")
-    slider.valueChanged.connect(lambda v: val.setText(fmt.format(v)))
+    slider.valueChanged.connect(lambda v: val.setText(fmt.format(v / scale)))
     h.addWidget(slider, stretch=1)
     h.addWidget(val)
-    return row, slider
+    return row, slider, lbl, val
+
+
+def _field_row(name_lbl: QLabel, field: QWidget) -> QWidget:
+    h = QHBoxLayout()
+    h.setSpacing(TOKENS.spacing.sm)
+    name_lbl.setMinimumWidth(80)
+    name_lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
+    h.addWidget(name_lbl)
+    h.addWidget(field, 1)
+    container = QWidget()
+    container.setLayout(h)
+    return container
 
 
 class ImagePlaceholder(QFrame):
@@ -58,17 +72,22 @@ class ImagePlaceholder(QFrame):
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setStyleSheet("font-size: 32px; border: none;")
         layout.addWidget(icon)
-        cap = QLabel(f"Image {index}")
-        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cap.setStyleSheet(
+        self._cap = QLabel()
+        self._cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cap.setStyleSheet(
             f"color: {TOKENS.colors.text_disabled}; "
             f"font-size: {TOKENS.font_size.caption}px; border: none;"
         )
-        layout.addWidget(cap)
+        layout.addWidget(self._cap)
+        self._index = index
+        self.retranslate()
+
+    def retranslate(self) -> None:
+        self._cap.setText(f'{tr("img_cell")} {self._index}')
 
 
 class ImageWorkspace(BaseWorkspace):
-    """Рабочее пространство генерации изображений (каркас)."""
+    """Рабочее пространство генерации изображений."""
 
     generate_requested = Signal(str, dict)   # (prompt, params)
     stop_requested = Signal()
@@ -77,7 +96,10 @@ class ImageWorkspace(BaseWorkspace):
         return "image"
 
     def _pipeline_steps(self) -> list[str]:
-        return ["Prompt", "Model", "Sampler", "Upscale", "Output"]
+        return [
+            tr("step_prompt"), tr("step_model"), tr("step_sampler"),
+            tr("step_upscale"), tr("step_output"),
+        ]
 
     def _build_toolbar(self) -> QToolBar:
         tb = QToolBar()
@@ -89,7 +111,7 @@ class ImageWorkspace(BaseWorkspace):
         )
 
         self._btn_generate = QToolButton()
-        self._btn_generate.setText("▶  Generate")
+        self._btn_generate.setText(tr("tts_generate"))
         self._btn_generate.setStyleSheet(
             f"QToolButton {{ background: {TOKENS.colors.accent_primary}; "
             f"color: {TOKENS.colors.text_on_accent}; "
@@ -102,7 +124,7 @@ class ImageWorkspace(BaseWorkspace):
         tb.addWidget(self._btn_generate)
 
         self._btn_stop = QToolButton()
-        self._btn_stop.setText("⏹  Stop")
+        self._btn_stop.setText(tr("tts_stop"))
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self.stop_requested.emit)
         tb.addWidget(self._btn_stop)
@@ -112,7 +134,7 @@ class ImageWorkspace(BaseWorkspace):
         tb.addWidget(spacer)
 
         self._model_selector = ModelSelector(
-            category="image", placeholder="Select image model…"
+            category="image", placeholder=tr("img_model_ph")
         )
         tb.addWidget(self._model_selector)
         return tb
@@ -127,22 +149,21 @@ class ImageWorkspace(BaseWorkspace):
         )
 
         self._prompt = QTextEdit()
-        self._prompt.setPlaceholderText(
-            "Describe the image to generate…\n\n"
-            "Supports prompts, negative prompts and style tags."
-        )
+        self._prompt.setPlaceholderText(tr("img_prompt_ph"))
         self._prompt.setMinimumHeight(120)
         self._prompt.setMaximumHeight(180)
         layout.addWidget(self._prompt)
 
-        self._tags = TagInput(placeholder="Style tags (Enter to add)…")
+        self._tags = TagInput(placeholder=tr("img_tags_ph"))
         layout.addWidget(self._tags)
 
-        # Сетка-плейсхолдеры результатов
         grid = QGridLayout()
         grid.setSpacing(TOKENS.spacing.md)
+        self._cells: list[ImagePlaceholder] = []
         for i in range(4):
-            grid.addWidget(ImagePlaceholder(i + 1), i // 2, i % 2)
+            cell = ImagePlaceholder(i + 1)
+            self._cells.append(cell)
+            grid.addWidget(cell, i // 2, i % 2)
         grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         layout.addLayout(grid, stretch=1)
 
@@ -157,52 +178,67 @@ class ImageWorkspace(BaseWorkspace):
             TOKENS.spacing.lg, TOKENS.spacing.lg,
         )
 
-        sampler_group = CollapsibleGroup("Sampler")
+        self._sampler_group = CollapsibleGroup(tr("img_sampler"))
         sl = QVBoxLayout()
         sl.setSpacing(TOKENS.spacing.xs)
 
-        row_steps, self._slider_steps = _slider_row("Steps:", 1, 150, 28)
-        row_cfg, self._slider_cfg = _slider_row("CFG:", 10, 200, 70)
-        cfg_val = row_cfg.findChildren(QLabel)[-1]
-        cfg_val.setText("7.0")
-        self._slider_cfg.valueChanged.connect(
-            lambda v: cfg_val.setText(f"{v / 10:.1f}")
-        )
-        sl.addWidget(row_steps)
+        self._row_steps = _slider_row(tr("img_steps"), 1, 150, 28)
+        self._slider_steps = self._row_steps[1]
+        sl.addWidget(self._row_steps[0])
 
-        row_seed = QHBoxLayout()
-        lbl = QLabel("Seed:")
-        lbl.setMinimumWidth(80)
-        lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
-        row_seed.addWidget(lbl)
+        self._row_cfg = _slider_row(tr("img_cfg"), 10, 200, 70, scale=10.0, fmt="{:.1f}")
+        self._slider_cfg = self._row_cfg[1]
+        sl.addWidget(self._row_cfg[0])
+
+        self._seed_lbl = QLabel(tr("img_seed"))
         self._spin_seed = QSpinBox()
         self._spin_seed.setRange(-1, 2_147_483_647)
         self._spin_seed.setValue(-1)
-        self._spin_seed.setSpecialValueText("random")
-        row_seed.addWidget(self._spin_seed, 1)
-        seed_container = QWidget()
-        seed_container.setLayout(row_seed)
-        sl.addWidget(row_cfg)
-        sl.addWidget(seed_container)
+        self._spin_seed.setSpecialValueText(tr("img_seed_random"))
+        sl.addWidget(_field_row(self._seed_lbl, self._spin_seed))
 
-        sampler_group.set_content_layout(sl)
-        layout.addWidget(sampler_group)
+        self._sampler_group.set_content_layout(sl)
+        layout.addWidget(self._sampler_group)
 
-        size_group = CollapsibleGroup("Output")
-        of = QFormLayout()
+        self._out_group = CollapsibleGroup(tr("img_output_block"))
+        ol = QVBoxLayout()
+        self._size_lbl = QLabel(tr("img_size"))
         self._size = QComboBox()
         self._size.addItems(["512×512", "768×768", "1024×1024", "832×1216", "1216×832"])
         self._size.setCurrentText("1024×1024")
-        of.addRow("Size:", self._size)
+        ol.addWidget(_field_row(self._size_lbl, self._size))
+        self._batch_lbl = QLabel(tr("img_batch"))
         self._batch = QSpinBox()
         self._batch.setRange(1, 8)
         self._batch.setValue(1)
-        of.addRow("Batch:", self._batch)
-        size_group.set_content_layout(of)
-        layout.addWidget(size_group)
+        ol.addWidget(_field_row(self._batch_lbl, self._batch))
+        self._out_group.set_content_layout(ol)
+        layout.addWidget(self._out_group)
 
         layout.addStretch()
         return sidebar
+
+    # ── i18n ──
+
+    def retranslate_ui(self) -> None:
+        self._btn_generate.setText(tr("tts_generate"))
+        self._btn_stop.setText(tr("tts_stop"))
+        self._model_selector.setPlaceholderText(tr("img_model_ph"))
+        self._prompt.setPlaceholderText(tr("img_prompt_ph"))
+        self._sampler_group.set_title(tr("img_sampler"))
+        self._row_steps[2].setText(tr("img_steps"))
+        self._row_cfg[2].setText(tr("img_cfg"))
+        self._seed_lbl.setText(tr("img_seed"))
+        self._spin_seed.setSpecialValueText(tr("img_seed_random"))
+        self._out_group.set_title(tr("img_output_block"))
+        self._size_lbl.setText(tr("img_size"))
+        self._batch_lbl.setText(tr("img_batch"))
+        for cell in self._cells:
+            cell.retranslate()
+        if self._pipeline_strip is not None:
+            self._pipeline_strip.set_steps(self._pipeline_steps())
+
+    # ── Behavior ──
 
     def _on_generate(self) -> None:
         prompt = self._prompt.toPlainText().strip()
@@ -216,7 +252,6 @@ class ImageWorkspace(BaseWorkspace):
             "batch": self._batch.value(),
             "tags": self._tags.tags(),
         }
-        # Заглушка: сигнал есть, контроллер image-движка подключится отдельным этапом.
         self.generate_requested.emit(prompt, params)
 
     def set_busy(self, busy: bool) -> None:

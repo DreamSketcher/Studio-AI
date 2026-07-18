@@ -32,13 +32,18 @@ import urllib.parse
 import urllib.request
 
 # Локализация подписей провайдеров (i18n не зависит от tkinter).
-# Безопасный импорт с фолбэком: в headless-сборке (ai_studio_core) модуля i18n нет.
+# Порядок попыток: (1) модуль ядра ai_studio_core.i18n — есть в этой сборке,
+# (2) внешний модуль i18n проекта-хоста (XTTS-Studio-AI),
+# (3) безопасный фолбэк — вернуть ключ как есть (для чисто headless-окружений).
 try:
-    from i18n import t as _t
+    from ai_studio_core.i18n import t as _t
 except ImportError:
+    try:
+        from i18n import t as _t
+    except ImportError:
 
-    def _t(key: str) -> str:
-        return key
+        def _t(key: str) -> str:
+            return key
 from ai_studio_core.secret_store import is_protected, protect_secret, unprotect_secret
 
 

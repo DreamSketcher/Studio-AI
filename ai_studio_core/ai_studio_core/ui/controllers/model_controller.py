@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 
+from ai_studio_core.i18n import t as tr
+
 from .base_controller import BaseController
 
 

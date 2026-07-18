@@ -5,6 +5,8 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal, Slot
 
+from ai_studio_core.i18n import t as tr
+
 from .base_controller import BaseController
 
 
@@ -31,11 +33,11 @@ class TTSController(BaseController):
             self._normalize_fn = TextNormalizer().normalize
             self._chunk_fn = TextChunker().chunk_text
             self._engine_loaded = True
-            self.status_message.emit("TTS engine loaded")
-            self.log_message.emit("INFO", "TTS engine dependencies loaded")
+            self.status_message.emit(tr("ctl_engine_loaded"))
+            self.log_message.emit("INFO", tr("ctl_engine_loaded"))
             return True
         except Exception as e:
-            self.status_message.emit(f"TTS engine unavailable: install torch/TTS")
+            self.status_message.emit(tr("ctl_tts_missing"))
             self.log_message.emit("WARN", f"TTS engine unavailable: {e}")
             return False
 
@@ -43,9 +45,7 @@ class TTSController(BaseController):
     def on_generate(self, text: str, params: dict) -> None:
         if not self._ensure_engine():
             self.pipeline_step_changed.emit(0, "error")
-            self.error_occurred.emit(
-                "TTS-движок недоступен. Установите torch и TTS через вкладку «Окружение»."
-            )
+            self.error_occurred.emit(tr("ctl_tts_missing"))
             return
         self.generation_started.emit()
         worker = self._run_in_background(self._generate_impl, text=text, params=params)
@@ -109,5 +109,5 @@ class TTSController(BaseController):
     @Slot()
     def on_stop(self) -> None:
         self.cancel_current()
-        self.status_message.emit("Generation cancelled")
-        self.log_message.emit("INFO", "Generation cancelled by user")
+        self.status_message.emit(tr("ctl_gen_cancelled"))
+        self.log_message.emit("INFO", tr("ctl_gen_cancelled"))

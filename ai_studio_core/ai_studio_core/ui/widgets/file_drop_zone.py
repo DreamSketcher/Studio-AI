@@ -22,6 +22,7 @@ class FileDropZone(QWidget):
         super().__init__(parent)
         self._accepted = [e.lower() for e in (accepted_extensions or [])]
         self._current_path: str | None = None
+        self._default_label = label
 
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -55,6 +56,12 @@ class FileDropZone(QWidget):
 
     def current_path(self) -> str | None:
         return self._current_path
+
+    def set_label(self, text: str) -> None:
+        """Меняет текст-заглушку зоны (при смене языка), если файл не выбран."""
+        self._default_label = text
+        if self._current_path is None:
+            self._label.setText(text)
 
     def clear(self) -> None:
         self._current_path = None
