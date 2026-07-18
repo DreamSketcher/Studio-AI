@@ -220,6 +220,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ctl_img_missing": "No image backend available: install diffusers/torch or configure an image API key",
         "ctl_export_done": "Exported:",
         "ctl_export_fail": "Export failed",
+        "msg_nothing_to_export": "Nothing to export yet — generate audio first.",
+        "dlg_save_audio": "Export audio",
         # ── gpt_client provider labels ──
         "prov_groq": "Groq (fast, VPN required)",
         "prov_openrouter": "OpenRouter (works without VPN)",
@@ -401,6 +403,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ctl_img_missing": "Нет image-бэкенда: установите diffusers/torch или укажите ключ image API",
         "ctl_export_done": "Экспортировано:",
         "ctl_export_fail": "Ошибка экспорта",
+        "msg_nothing_to_export": "Экспортировать пока нечего — сначала сгенерируйте аудио.",
+        "dlg_save_audio": "Экспорт аудио",
         # ── gpt_client provider labels ──
         "prov_groq": "Groq (быстрый, нужен VPN)",
         "prov_openrouter": "OpenRouter (работает без VPN)",

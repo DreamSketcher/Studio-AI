@@ -257,9 +257,11 @@ class MainWindow(QMainWindow):
 
     # ── Wiring controllers <→ UI ──
     def _wire_controllers(self) -> None:
-        # TTS
+        # TTS (очередь задач получает реальные задачи генерации)
+        self._tts_ctrl.attach_queue(self._queue_ctrl)
         self._tts_workspace.generate_requested.connect(self._tts_ctrl.on_generate)
         self._tts_workspace.stop_requested.connect(self._tts_ctrl.on_stop)
+        self._tts_workspace.export_requested.connect(self._on_export)
         self._tts_ctrl.busy_changed.connect(self._tts_workspace.set_busy)
         self._tts_ctrl.status_message.connect(self._resource_bar.set_message)
         self._tts_ctrl.pipeline_step_changed.connect(self._on_tts_step)
@@ -276,6 +278,9 @@ class MainWindow(QMainWindow):
         self._chat_ctrl.status_message.connect(self._resource_bar.set_message)
         self._chat_ctrl.log_message.connect(self._log_widget.append)
         self._chat_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
+
+        # History: выбор элемента → Inspector
+        self._history_widget.item_selected.connect(self._on_history_selected)
 
         # Model hub
         self._model_widget.download_requested.connect(self._model_ctrl.download_model)
@@ -297,6 +302,33 @@ class MainWindow(QMainWindow):
     def _on_tts_done(self, output_path: str) -> None:
         self._resource_bar.set_message(f'{tr("msg_generation_complete")}: {output_path}')
         self._toast(f'{tr("msg_generation_complete")}\n{output_path}', "success")
+        # Реальная волна + воспроизведение + экспорт
+        try:
+            wf = self._tts_workspace.waveform_widget()
+            wf.set_audio(output_path)
+            self._tts_workspace.set_export_available(True)
+            if self._tts_workspace.autoplay_checked():
+                wf._toggle_play()
+        except Exception as e:
+            self._log_widget.append("WARN", f"waveform load failed: {e}")
+        # История обновляется с диска — записи реальные
+        self._history_widget.refresh()
+
+    def _on_history_selected(self, path: str) -> None:
+        import os
+        props = {}
+        try:
+            st = os.stat(path)
+            props = {
+                "Size": f"{st.st_size / (1024 * 1024):.2f} MB",
+                "Path": path,
+            }
+        except OSError:
+            props = {"Path": path}
+        self._inspector_widget.show_item(
+            os.path.basename(path), "TTS", props,
+            details=path,
+        )
 
     # ── Layout persistence ──
     def _restore_layout(self) -> None:
@@ -323,7 +355,32 @@ class MainWindow(QMainWindow):
         self._toast(tr("msg_menu_stub"), "info")
 
     def _on_export(self) -> None:
-        self._toast(tr("msg_menu_stub"), "info")
+        """Реальный экспорт последнего сгенерированного аудио."""
+        last = self._tts_ctrl.last_output()
+        if not last:
+            self._toast(tr("msg_nothing_to_export"), "warning")
+            return
+        import os
+        from PySide6.QtWidgets import QFileDialog
+        ext = os.path.splitext(last)[1].lower().lstrip(".") or "wav"
+        suggested = os.path.basename(last)
+        target, _sel = QFileDialog.getSaveFileName(
+            self, tr("dlg_save_audio"), suggested,
+            "Audio (*.wav *.mp3 *.flac *.ogg)",
+        )
+        if not target:
+            return
+        # Пользователь мог не дописать расширение — берём формат источника
+        if not os.path.splitext(target)[1]:
+            target = f"{target}.{ext}"
+        try:
+            out = self._tts_ctrl.export_last(target)
+        except Exception as e:
+            self._toast(f'{tr("ctl_export_fail")}\n{type(e).__name__}: {e}', "error")
+            self._log_widget.append("ERROR", f"export failed: {e}")
+            return
+        self._toast(f'{tr("ctl_export_done")}\n{out}', "success")
+        self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
 
     def _on_manage_models(self) -> None:
         self._toast(tr("msg_menu_stub"), "info")

@@ -260,7 +260,12 @@ class TTSWorkspace(BaseWorkspace):
     def set_busy(self, busy: bool) -> None:
         self._btn_generate.setEnabled(not busy)
         self._btn_stop.setEnabled(busy)
-        self._btn_export.setEnabled(not busy)
+
+    def set_export_available(self, available: bool) -> None:
+        self._btn_export.setEnabled(available)
+
+    def autoplay_checked(self) -> bool:
+        return self._out_autoplay.isChecked()
 
     # ── Helpers ──
 

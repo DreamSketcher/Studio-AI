@@ -31,15 +31,6 @@ class QueueController(BaseController):
     def __init__(self):
         super().__init__()
         self._tasks: dict[str, QueueTask] = {}
-        # Две демо-задачи для отображения
-        self._add_demo()
-
-    def _add_demo(self) -> None:
-        from uuid import uuid4
-        t1 = QueueTask(id=str(uuid4())[:6], type="TTS", model="XTTS v2", status="running", progress=45)
-        t2 = QueueTask(id=str(uuid4())[:6], type="TTS", model="XTTS v2", status="queued", progress=0)
-        for t in (t1, t2):
-            self._tasks[t.id] = t
 
     def add_task(self, type_: str, model: str, params: dict | None = None) -> str:
         from uuid import uuid4
@@ -49,6 +40,7 @@ class QueueController(BaseController):
             model=model,
             params=params or {},
         )
+        task.status = "running"
         self._tasks[task.id] = task
         self.task_added.emit(task.id)
         self.queue_changed.emit(list(self._tasks.values()))
@@ -77,6 +69,8 @@ class QueueController(BaseController):
             t.progress = percent
             t.status = status
             self.task_updated.emit(task_id)
+            # Панель перерисовывается по queue_changed — прогресс виден живьём
+            self.queue_changed.emit(list(self._tasks.values()))
 
     def running_count(self) -> int:
         return sum(1 for t in self._tasks.values() if t.status == "running")
