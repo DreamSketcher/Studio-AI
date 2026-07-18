@@ -1,0 +1,89 @@
+name: Architecture Gate & Headless Tests
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master, dev]
+
+jobs:
+  architecture:
+    name: Architecture gate (import-linter + plugin manifests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install import-linter packaging pytest pytest-timeout
+
+      - name: Layered architecture contract (lint-imports)
+        run: python tools/check_architecture.py
+
+      - name: Plugin manifest validation
+        run: python tools/check_plugin_deps.py
+
+  headless-tests:
+    name: Headless tests (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libsndfile1
+
+      - name: Install core dependencies (no GUI frameworks, no heavy ML)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-core.txt
+          pip install pytest pytest-timeout pytest-cov import-linter packaging
+        shell: bash
+
+      - name: Smoke-import ai_studio_core.env_core (headless)
+        run: |
+          python -c "import ai_studio_core.env_core; from ai_studio_core.env_core import install_state; print('headless import OK')"
+
+      - name: Run headless pytest suite
+        # Запускаем только те тесты, которые не требуют torch/TTS/customtkinter.
+        # Тесты на torch/TTS/rvc будут включаться после установки соотв. extras.
+        run: |
+          python -m pytest \
+            test/test_chunker.py \
+            test/test_normalizer.py \
+            test/test_smart_pauses.py \
+            test/test_prosody_layer.py \
+            test/test_de_esser.py \
+            test/test_word_replacer.py \
+            test/test_history_store.py \
+            test/test_output_naming.py \
+            test/test_validation.py \
+            test/test_release_hashing.py \
+            test/test_update_signing.py \
+            test/test_env_core_init.py \
+            test/test_ai_conductor.py \
+            -v
+        shell: bash

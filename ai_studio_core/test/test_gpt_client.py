@@ -1,0 +1,392 @@
+import sys
+import types
+import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import ai_studio_core.gpt_client as gpt_client
+from ai_studio_core.gpt_client import (
+    AIUnavailable,
+    GroqNetworkError,
+    GroqRateLimitError,
+    _build_provider_chain,
+    _call_with_chain,
+    get_chain_diagnostics,
+    _provider_available,
+)
+
+
+@pytest.fixture(autouse=True)
+def clean_gpt_settings(tmp_path, monkeypatch):
+    """Изолируем gpt_settings.json на tmp_path, чтобы реальные файлы не трогать."""
+    settings_file = tmp_path / "gpt_settings.json"
+    # Патчим константы модуля
+    monkeypatch.setattr(gpt_client, "_SETTINGS_PATH", str(settings_file))
+    monkeypatch.setattr(gpt_client, "_BASE_DIR", str(tmp_path))
+    monkeypatch.setenv("XTTS_TEST_SECRET_STORE", "1")
+    # Очищаем кэш импорта local_llm_client если был
+    # Ничего не делаем
+    yield settings_file
+
+
+class TestSecurityAndSettings:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///etc/passwd",
+            "ftp://example.com/api",
+            "http://example.com/v1/chat/completions",
+            "https://user:pass@example.com/api",
+            "https://example.com/api#fragment",
+            "",
+        ],
+    )
+    def test_rejects_unsafe_api_urls(self, url):
+        with pytest.raises(ValueError):
+            gpt_client._validate_api_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/v1/chat/completions",
+            "http://localhost:11434/v1/chat/completions",
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "http://[::1]:11434/v1/chat/completions",
+        ],
+    )
+    def test_accepts_https_and_loopback_http(self, url):
+        assert gpt_client._validate_api_url(url) == url
+
+    def test_custom_provider_rejects_plain_http(self):
+        with pytest.raises(ValueError, match="HTTP"):
+            gpt_client.add_custom_provider(
+                "unsafe", "Unsafe", "http://example.com/api", ["model"], "model"
+            )
+
+    def test_settings_write_is_atomic_and_leaves_no_temp(self, clean_gpt_settings):
+        gpt_client._write_settings({"provider": "groq"})
+        data = json.loads(clean_gpt_settings.read_text(encoding="utf-8"))
+        assert data["provider"] == "groq"
+        assert not list(clean_gpt_settings.parent.glob(".gpt_settings_*.tmp"))
+
+    def test_api_key_is_not_stored_in_plaintext(self, clean_gpt_settings):
+        gpt_client.set_api_key("super-secret", "groq")
+        raw = clean_gpt_settings.read_text(encoding="utf-8")
+        assert "super-secret" not in raw
+        assert gpt_client.get_api_key("groq") == "super-secret"
+
+    def test_legacy_plaintext_key_is_migrated(self, clean_gpt_settings):
+        clean_gpt_settings.write_text('{"api_key_groq":"legacy-secret"}', encoding="utf-8")
+        assert gpt_client.get_api_key("groq") == "legacy-secret"
+        assert "legacy-secret" not in clean_gpt_settings.read_text(encoding="utf-8")
+
+
+class TestBuildProviderChain:
+    def test_active_first_if_available(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "groq")
+        monkeypatch.setattr(gpt_client, "_provider_available", lambda pid: pid == "groq")
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: set())
+        monkeypatch.setattr(gpt_client, "list_custom_providers", lambda: [])
+
+        chain = _build_provider_chain()
+        assert chain == ["groq"]
+
+    def test_active_not_available_excluded(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "groq")
+
+        # groq без ключа, openrouter с ключом
+        def avail(pid):
+            return pid == "openrouter"
+
+        monkeypatch.setattr(gpt_client, "_provider_available", avail)
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: set())
+        monkeypatch.setattr(gpt_client, "list_custom_providers", lambda: [])
+
+        chain = _build_provider_chain()
+        assert "groq" not in chain
+        assert "openrouter" in chain
+
+    def test_hidden_providers_skipped(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "groq")
+        monkeypatch.setattr(gpt_client, "_provider_available", lambda pid: True)
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: {"proxy"})
+        monkeypatch.setattr(gpt_client, "list_custom_providers", lambda: [])
+
+        chain = _build_provider_chain()
+        assert "proxy" not in chain
+        assert "groq" in chain
+        # groq активный должен быть первым
+        assert chain[0] == "groq"
+
+    def test_custom_providers_after_builtin(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "groq")
+        monkeypatch.setattr(gpt_client, "_provider_available", lambda pid: True)
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: set())
+        monkeypatch.setattr(gpt_client, "list_custom_providers", lambda: [{"id": "my_custom"}])
+
+        chain = _build_provider_chain()
+        # порядок: active, остальные встроенные, затем кастомные
+        assert chain[0] == "groq"
+        assert chain[-1] == "my_custom"
+        # все PROVIDERS кроме groq должны быть между
+        builtin_ids = set(gpt_client.PROVIDERS.keys()) - {"groq"}
+        assert builtin_ids.issubset(set(chain))
+
+    def test_active_custom_provider(self, monkeypatch):
+        # активный — кастомный
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "my_custom")
+
+        def avail(pid):
+            return pid in ("my_custom", "groq")
+
+        monkeypatch.setattr(gpt_client, "_provider_available", avail)
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: set())
+        monkeypatch.setattr(gpt_client, "list_custom_providers", lambda: [{"id": "my_custom"}])
+
+        chain = _build_provider_chain()
+        assert chain[0] == "my_custom"
+
+
+class TestProviderAvailable:
+    def test_builtin_with_key(self, monkeypatch):
+        monkeypatch.setattr(
+            gpt_client, "get_api_key", lambda pid=None: "sk-123" if pid == "groq" else ""
+        )
+        assert _provider_available("groq") is True
+        assert _provider_available("proxy") is False
+
+    def test_local_with_model(self, monkeypatch):
+        # мок local_llm_client
+        fake_local = types.ModuleType("ai_studio_core.local_llm_client")
+        fake_local.get_active_model = lambda: "model.gguf"
+        monkeypatch.setitem(sys.modules, "ai_studio_core.local_llm_client", fake_local)
+        # также нужно для from ai_studio_core import local_llm_client внутри функции
+        fake_engine = types.ModuleType("ai_studio_core")
+        fake_engine.local_llm_client = fake_local
+        monkeypatch.setitem(sys.modules, "ai_studio_core", fake_engine)
+        assert _provider_available("local") is True
+
+    def test_local_without_model(self, monkeypatch):
+        fake_local = types.ModuleType("ai_studio_core.local_llm_client")
+        fake_local.get_active_model = lambda: None
+        monkeypatch.setitem(sys.modules, "ai_studio_core.local_llm_client", fake_local)
+        fake_engine = types.ModuleType("ai_studio_core")
+        fake_engine.local_llm_client = fake_local
+        monkeypatch.setitem(sys.modules, "ai_studio_core", fake_engine)
+        assert _provider_available("local") is False
+
+
+class TestCallWithChain:
+    def test_empty_chain_raises_ai_unavailable(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: [])
+        with pytest.raises(AIUnavailable, match="Нет ни одного"):
+            _call_with_chain([{"role": "user", "content": "hi"}])
+
+    def test_success_on_first_provider(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq"])
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid: "model1")
+        monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "model1")
+        monkeypatch.setattr(gpt_client, "_call_api", lambda *a, **kw: "OK")
+
+        result = _call_with_chain([{"role": "user", "content": "hi"}])
+        assert result == "OK"
+
+    def test_fallback_to_second_model_on_rate_limit(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq"])
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid: "primary")
+        monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "fallback")
+
+        calls = []
+
+        def fake_call_api(messages, model=None, max_tokens=0, provider=None):
+            calls.append(model)
+            if model == "primary":
+                raise GroqRateLimitError("429")
+            return "fallback_ok"
+
+        monkeypatch.setattr(gpt_client, "_call_api", fake_call_api)
+
+        result = _call_with_chain([{"role": "user", "content": "hi"}])
+        assert result == "fallback_ok"
+        assert calls == ["primary", "fallback"]
+
+    def test_fallback_to_next_provider_on_network_error(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq", "proxy"])
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid: f"{pid}_model")
+        monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: f"{pid}_model")
+
+        def fake_api(messages, model=None, max_tokens=0, provider=None):
+            if provider == "groq":
+                raise GroqNetworkError("no internet")
+            return f"ok from {provider}"
+
+        monkeypatch.setattr(gpt_client, "_call_api", fake_api)
+
+        result = _call_with_chain([{"role": "user", "content": "hi"}])
+        assert result == "ok from proxy"
+
+    def test_all_network_failures_raises_no_internet(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq", "proxy"])
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid: "m")
+        monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "m")
+        monkeypatch.setattr(
+            gpt_client, "_call_api", lambda *a, **kw: (_ for _ in ()).throw(GroqNetworkError("net"))
+        )
+
+        with pytest.raises(AIUnavailable, match="Нет подключения"):
+            _call_with_chain([{"role": "user", "content": "hi"}])
+
+    def test_all_providers_fail_raises_all_unavailable(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq", "proxy"])
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid: "m1")
+        monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "m2")
+
+        def fake_api(*a, **kw):
+            raise GroqRateLimitError("limit")
+
+        monkeypatch.setattr(gpt_client, "_call_api", fake_api)
+
+        with pytest.raises(AIUnavailable, match="Все провайдеры"):
+            _call_with_chain([{"role": "user", "content": "hi"}])
+
+    def test_generic_exception_continues_chain(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq", "openrouter"])
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid: "m")
+        monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "m")
+
+        def fake_api(messages, model=None, max_tokens=0, provider=None):
+            if provider == "groq":
+                raise RuntimeError("unexpected")
+            return "ok openrouter"
+
+        monkeypatch.setattr(gpt_client, "_call_api", fake_api)
+
+        result = _call_with_chain([{"role": "user", "content": "hi"}])
+        assert result == "ok openrouter"
+
+
+class TestChainDiagnostics:
+    def test_diagnostics_structure(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "groq")
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: set())
+        monkeypatch.setattr(
+            gpt_client, "get_api_key", lambda pid=None: "key" if pid == "groq" else ""
+        )
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid=None: f"{pid}_model")
+        monkeypatch.setattr(
+            gpt_client, "list_custom_providers", lambda: [{"id": "custom1", "label": "Custom"}]
+        )
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq"])
+
+        diag = get_chain_diagnostics()
+        assert "active" in diag
+        assert "chain_order" in diag
+        assert "providers" in diag
+        assert diag["active"] == "groq"
+        # должен содержать все встроенные + кастомный
+        ids = {p["id"] for p in diag["providers"]}
+        assert "groq" in ids
+        assert "custom1" in ids
+
+    def test_hidden_marked(self, monkeypatch):
+        monkeypatch.setattr(gpt_client, "get_provider", lambda: "groq")
+        monkeypatch.setattr(gpt_client, "get_hidden_providers", lambda: {"openrouter"})
+        monkeypatch.setattr(gpt_client, "get_api_key", lambda pid=None: "k")
+        monkeypatch.setattr(gpt_client, "get_model", lambda pid=None: "m")
+        monkeypatch.setattr(gpt_client, "list_custom_providers", lambda: [])
+        monkeypatch.setattr(gpt_client, "_build_provider_chain", lambda: ["groq"])
+
+        diag = get_chain_diagnostics()
+        openrouter_entry = next(p for p in diag["providers"] if p["id"] == "openrouter")
+        assert openrouter_entry["status"] == "hidden"
+
+
+class TestSensitiveHeaderDenylist:
+    """TASK-005: кастомный провайдер не может переопределить sensitive-заголовки."""
+
+    def test_apply_blocks_sensitive_keeps_custom(self):
+        headers = {"Authorization": "Bearer real", "Content-Type": "application/json"}
+        gpt_client._apply_extra_headers(
+            headers,
+            {
+                "Authorization": "Bearer evil",
+                "Content-Type": "text/plain",
+                "Host": "evil.com",
+                "Cookie": "session=hijack",
+                "Set-Cookie": "x=1",
+                "Proxy-Authorization": "Basic x",
+                "Transfer-Encoding": "chunked",
+                "Content-Length": "0",
+                "X-Custom-Foo": "bar",
+                "HTTP-Referer": "https://xtts-studio.local",
+            },
+        )
+        assert headers["Authorization"] == "Bearer real"
+        assert headers["Content-Type"] == "application/json"
+        for blocked in (
+            "Host",
+            "Cookie",
+            "Set-Cookie",
+            "Proxy-Authorization",
+            "Transfer-Encoding",
+            "Content-Length",
+        ):
+            assert blocked not in headers
+        assert headers["X-Custom-Foo"] == "bar"
+        assert headers["HTTP-Referer"] == "https://xtts-studio.local"
+
+    def test_apply_is_case_insensitive(self):
+        headers = {"Authorization": "Bearer real"}
+        gpt_client._apply_extra_headers(
+            headers, {"AUTHORIZATION": "Bearer evil", "content-LENGTH": "0", "hOsT": "evil"}
+        )
+        assert headers["Authorization"] == "Bearer real"
+        assert "content-LENGTH" not in headers
+        assert "hOsT" not in headers
+
+    def test_custom_provider_authorization_does_not_override_real(
+        self, clean_gpt_settings, monkeypatch
+    ):
+        gpt_client.add_custom_provider(
+            "evil",
+            "Evil",
+            "https://example.com/v1/chat/completions",
+            ["m"],
+            "m",
+            headers={"Authorization": "Bearer evil", "X-Test": "1"},
+        )
+        gpt_client.set_api_key("real-key", "evil")
+        gpt_client.set_provider("evil")
+
+        captured = {}
+
+        class FakeResp:
+            def __init__(self):
+                self.headers = {}
+                self.status = 200
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=60):
+            captured["lower"] = {k.lower(): v for k, v in req.header_items()}
+            return FakeResp()
+
+        monkeypatch.setattr(gpt_client.urllib.request, "urlopen", fake_urlopen)
+
+        result = gpt_client._call_api(
+            [{"role": "user", "content": "hi"}], model="m", provider="evil"
+        )
+        assert result == "ok"
+        # реальный Authorization (от ключа) preserved; подмена игнорирована
+        assert captured["lower"]["authorization"] == "Bearer real-key"
+        # кастомный не-sensitive заголовок прошёл
+        assert captured["lower"]["x-test"] == "1"

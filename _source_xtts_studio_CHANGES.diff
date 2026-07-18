@@ -1,0 +1,314 @@
+============================================================================
+ DIFF-ОТЧЁТ: правки Этапа A в _source_xtts_studio/
+ Дата:       2026-07-18 18:51 UTC
+ Базовый хеш: a28df4a Fix CI (shallow clone, depth=1)
+ --------------------------------------------------------------------------
+ Цель правок: устранение нарушений #1-#4 графа импортов:
+   - #1-#3: engine/env_core/rvc_setup.py и torch_setup.py импортировали
+            install-lock функции из engine.gui.env_settings (верхний слой),
+            оборачивая в try/except ImportError с безопасными заглушками,
+            что тихо отключало защиту от параллельных pip-install.
+            Исправление: выделение этих функций в новый модуль
+            engine/env_core/install_state.py и прямой импорт оттуда
+            (без try/except, без заглушек);
+   - #4:    engine/gpt_client.py содержал жёсткий 'from i18n import t as _t',
+            что валило headless-импорт при отсутствии i18n.py.
+            Исправление: обёртка в try/except с фолбэк-функцией identity.
+ --------------------------------------------------------------------------
+ Результат:
+   - lint-imports по .importlinter: KEPT (1 контракт, 0 broken)
+   - pytest: 193 passed (до правок) / 193 passed (после правок)
+   - проверка headless-импорта engine.gpt_client без i18n: OK
+   - в engine/env_core/ больше нет ссылок на engine.gui.*
+   - публичные имена в engine/gui/env_settings.py сохранены через re-export
+ --------------------------------------------------------------------------
+ Список изменённых файлов:
+   ИЗМЕНЁН: engine/gui/env_settings.py       (re-export вместо определений)
+   ИЗМЕНЁН: engine/env_core/rvc_setup.py     (прямой импорт из install_state)
+   ИЗМЕНЁН: engine/env_core/torch_setup.py   (прямой импорт из install_state)
+   ИЗМЕНЁН: engine/gpt_client.py             (безопасный i18n импорт)
+   НОВЫЙ:   engine/env_core/install_state.py (содержимое перенесено дословно)
+   НОВЫЙ:   .importlinter                    (конфиг для import-linter)
+============================================================================
+
+
+########################################################################
+# НОВЫЙ ФАЙЛ: engine/env_core/install_state.py
+########################################################################
+
+# -*- coding: utf-8 -*-
+"""engine/env_core/install_state.py — глобальное состояние установки пакетов.
+
+Вынесен из engine/gui/env_settings.py на Этапе A (исправление нарушений #1–#3
+по ТЗ на извлечение env-движка): функции лока/состояния установки по смыслу
+относятся к слою env_core, а не к GUI-слою.
+
+GUI-обвязка (engine/gui/env_settings.py) продолжает видеть эти имена через
+re-export в том же модуле — ни один вызов в engine/gui/* не меняется.
+"""
+
+from __future__ import annotations
+
+import threading
+
+# ── ГЛОБАЛЬНЫЙ ЛОК УСТАНОВКИ (предотвращает одновременные pip install) ──
+# Используется всеми точками входа: startup recovery, settings buttons,
+# rvc_setup, torch_setup, llama_setup.
+_INSTALL_LOCK = threading.RLock()
+_INSTALL_STATE = {"running": False, "type": None, "cancelled": False}
+
+
+def _acquire_install_lock(install_type: str) -> bool:
+    """Пытается захватить лок установки.
+    Возвращает True если лок получен, False если другая установка уже идёт.
+    """
+    global _INSTALL_STATE
+    acquired = _INSTALL_LOCK.acquire(blocking=False)
+    if acquired:
+        _INSTALL_STATE = {"running": True, "type": install_type, "cancelled": False}
+        return True
+    return False
+
+
+def _release_install_lock():
+    """Освобождает лок установки."""
+    global _INSTALL_STATE
+    _INSTALL_STATE = {"running": False, "type": None, "cancelled": False}
+    _INSTALL_LOCK.release()
+
+
+def _is_install_running() -> bool:
+    """Проверяет, идёт ли какая-то установка."""
+    return _INSTALL_STATE.get("running", False)
+
+
+def _get_current_install_type() -> str:
+    """Возвращает тип текущей установки или пустую строку."""
+    return _INSTALL_STATE.get("type", "")
+
+
+def _set_install_cancelled():
+    """Помечает текущую установку как отменённую."""
+    _INSTALL_STATE["cancelled"] = True
+
+
+# Флаг для защиты clear_diagnostics_cache — не очищать, если идёт восстановление/установка
+def _can_clear_diagnostics_cache() -> bool:
+    """Возвращает True если можно безопасно очистить кэш диагностики."""
+    return not _is_install_running()
+
+
+########################################################################
+# НОВЫЙ ФАЙЛ: .importlinter (реконструкция по описанию слоёв из ТЗ)
+########################################################################
+
+[importlinter]
+root_package = engine
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Контракт №1: слоистая архитектура engine.
+#
+# Слои перечислены ОТ ВЕРХНЕГО К НИЖНЕМУ (как ожидает import-linter): модуль
+# имеет право импортировать только модули из собственного слоя и любых слоёв,
+# перечисленных НИЖЕ него в этом списке.
+#
+# Верхний слой  — engine.gui: вправе импортировать всё остальное.
+# Нижний слой  — engine.atomic_write: никого не вправе импортировать, будучи
+#                фундаментальной утилитой атомарной записи.
+# ─────────────────────────────────────────────────────────────────────────────
+[importlinter:contract:layers]
+name = layered_architecture
+type = layers
+layers =
+    engine.gui
+    engine.tts
+    engine.rvc_catalog
+    engine.rvc_pipeline
+    engine.ai_conductor
+    engine.gpt_client
+    engine.local_llm_client
+    engine.env_core
+    engine.logging_utils
+    engine.paths
+    engine.atomic_write
+ignore_imports =
+
+
+########################################################################
+# ИЗМЕНЁН: engine/gui/env_settings.py
+# --- unified diff (оригинал -> правленая версия) ---
+########################################################################
+
+--- _source_xtts_studio_clean/engine/gui/env_settings.py	2026-07-18 18:13:38.535295706 +0000
++++ _source_xtts_studio/engine/gui/env_settings.py	2026-07-18 18:45:13.844811903 +0000
+@@ -24,43 +24,17 @@
+ root = None
+ 
+ # ── ГЛОБАЛЬНЫЙ ЛОК УСТАНОВКИ (предотвращает одновременные pip install) ──
+-# Используется всеми точками входа: startup recovery, settings buttons, rvc_setup, torch_setup
+-_INSTALL_LOCK = threading.RLock()
+-_INSTALL_STATE = {"running": False, "type": None, "cancelled": False}
+-
+-
+-def _acquire_install_lock(install_type: str) -> bool:
+-    """Пытается захватить лок установки.
+-    Возвращает True если лок получен, False если другая установка уже идёт.
+-    """
+-    global _INSTALL_STATE
+-    acquired = _INSTALL_LOCK.acquire(blocking=False)
+-    if acquired:
+-        _INSTALL_STATE = {"running": True, "type": install_type, "cancelled": False}
+-        return True
+-    return False
+-
+-
+-def _release_install_lock():
+-    """Освобождает лок установки."""
+-    global _INSTALL_STATE
+-    _INSTALL_STATE = {"running": False, "type": None, "cancelled": False}
+-    _INSTALL_LOCK.release()
+-
+-
+-def _is_install_running() -> bool:
+-    """Проверяет, идёт ли какая-то установка."""
+-    return _INSTALL_STATE.get("running", False)
+-
+-
+-def _get_current_install_type() -> str:
+-    """Возвращает тип текущей установки или пустую строку."""
+-    return _INSTALL_STATE.get("type", "")
+-
+-
+-def _set_install_cancelled():
+-    """Помечает текущую установку как отменённую."""
+-    _INSTALL_STATE["cancelled"] = True
++# Состояние установки физически живёт в engine.env_core.install_state (нижний слой),
++# а сюда реэкспортируется для сохранения публичных имён всего engine/gui/* кода.
++from engine.env_core.install_state import (  # noqa: F401  (re-export)
++    _INSTALL_LOCK,
++    _INSTALL_STATE,
++    _acquire_install_lock,
++    _release_install_lock,
++    _is_install_running,
++    _get_current_install_type,
++    _set_install_cancelled,
++)
+ 
+ 
+ # ── ЕДИНЫЙ СПИСОК ПАКЕТОВ ДЛЯ ВОССТАНОВЛЕНИЯ (PACKAGE_PIP_SPEC) ──
+@@ -88,9 +62,7 @@
+ 
+ 
+ # Флаг для защиты clear_diagnostics_cache — не очищать, если идёт восстановление/установка
+-def _can_clear_diagnostics_cache() -> bool:
+-    """Возвращает True если можно безопасно очистить кэш диагностики."""
+-    return not _is_install_running()
++from engine.env_core.install_state import _can_clear_diagnostics_cache  # noqa: F401  (re-export)
+ 
+ 
+ # Флаг отмены текущего обновления — тот же формат, что использует
+
+
+########################################################################
+# ИЗМЕНЁН: engine/env_core/rvc_setup.py
+# --- unified diff (оригинал -> правленая версия) ---
+########################################################################
+
+--- _source_xtts_studio_clean/engine/env_core/rvc_setup.py	2026-07-18 18:13:38.531295706 +0000
++++ _source_xtts_studio/engine/env_core/rvc_setup.py	2026-07-18 18:45:29.784811903 +0000
+@@ -270,12 +270,7 @@
+     from engine.logging_utils import write_log
+ 
+     # Импортируем проверку лока установки для защиты кэша
+-    try:
+-        from engine.gui.env_settings import _can_clear_diagnostics_cache
+-    except ImportError:
+-
+-        def _can_clear_diagnostics_cache():
+-            return True
++    from engine.env_core.install_state import _can_clear_diagnostics_cache
+ 
+     def emit(line):
+         write_log(line)
+
+
+########################################################################
+# ИЗМЕНЁН: engine/env_core/torch_setup.py
+# --- unified diff (оригинал -> правленая версия) ---
+########################################################################
+
+--- _source_xtts_studio_clean/engine/env_core/torch_setup.py	2026-07-18 18:13:38.531295706 +0000
++++ _source_xtts_studio/engine/env_core/torch_setup.py	2026-07-18 18:45:39.124811903 +0000
+@@ -253,22 +253,11 @@
+     from engine.env_core.diagnostics import _read_pip_output
+ 
+     # Импортируем функции лока установки для предотвращения одновременных установок
+-    try:
+-        from engine.gui.env_settings import (
+-            _acquire_install_lock,
+-            _release_install_lock,
+-            _get_current_install_type,
+-        )
+-    except ImportError:
+-
+-        def _acquire_install_lock(install_type):
+-            return True
+-
+-        def _release_install_lock():
+-            pass
+-
+-        def _get_current_install_type():
+-            return "unknown"
++    from engine.env_core.install_state import (
++        _acquire_install_lock,
++        _release_install_lock,
++        _get_current_install_type,
++    )
+ 
+     def emit(line):
+         if progress_cb:
+@@ -454,13 +443,10 @@
+ def cancel_install_torch() -> bool:
+     global active_proc
+     # Также освобождаем лок установки, если он был захвачен
+-    try:
+-        from engine.gui.env_settings import _release_install_lock, _set_install_cancelled
++    from engine.env_core.install_state import _release_install_lock, _set_install_cancelled
+ 
+-        _set_install_cancelled()
+-        _release_install_lock()
+-    except ImportError:
+-        pass
++    _set_install_cancelled()
++    _release_install_lock()
+ 
+     global active_proc
+     if active_proc is not None:
+
+
+########################################################################
+# ИЗМЕНЁН: engine/gpt_client.py
+# --- unified diff (оригинал -> правленая версия) ---
+########################################################################
+
+--- _source_xtts_studio_clean/engine/gpt_client.py	2026-07-18 18:13:38.531295706 +0000
++++ _source_xtts_studio/engine/gpt_client.py	2026-07-18 18:45:45.812811903 +0000
+@@ -31,8 +31,14 @@
+ import urllib.parse
+ import urllib.request
+ 
+-# Локализация подписей провайдеров (i18n не зависит от tkinter)
+-from i18n import t as _t
++# Локализация подписей провайдеров (i18n не зависит от tkinter).
++# Безопасный импорт с фолбэком: в headless-сборке (ai_studio_core) модуля i18n нет.
++try:
++    from i18n import t as _t
++except ImportError:
++
++    def _t(key: str) -> str:
++        return key
+ from engine.secret_store import is_protected, protect_secret, unprotect_secret
+ 
+ 
+
+

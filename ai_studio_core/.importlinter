@@ -1,0 +1,30 @@
+[importlinter]
+root_package = ai_studio_core
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Слоистая архитектура ai_studio_core.
+#
+# Слои перечислены ОТ ВЕРХНЕГО К НИЖНЕМУ (как ожидает import-linter).
+# Каждый слой имеет право импортировать только себя и слои ниже.
+#
+# В этом проекте НЕТ GUI-слоя (он строится отдельно на PySide6 поверх этого
+# ядра и находится в отдельном репозитории/пакете). Сверху находится TTS/RVC
+# стек, снизу — фундаментальные утилиты (atomic_write, paths, logging_utils).
+#
+# Секция ignore_imports отсутствует — в этом репозитории с первого коммита
+# не должно быть зафиксированного технического долга по нарушению слоёв.
+# ─────────────────────────────────────────────────────────────────────────────
+[importlinter:contract:layers]
+name = layered_architecture
+type = layers
+layers =
+    ai_studio_core.tts
+    ai_studio_core.rvc_catalog
+    ai_studio_core.rvc_pipeline
+    ai_studio_core.ai_conductor
+    ai_studio_core.gpt_client
+    ai_studio_core.local_llm_client
+    ai_studio_core.env_core
+    ai_studio_core.logging_utils
+    ai_studio_core.paths
+    ai_studio_core.atomic_write

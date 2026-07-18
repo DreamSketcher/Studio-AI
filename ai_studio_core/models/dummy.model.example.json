@@ -1,0 +1,15 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "dummy.model.example",
+  "version": "0.1.0",
+  "display_name": "Example Dummy Model",
+  "description": "Пример манифеста плагина/модели для валидации формата. Удалите или замените при добавлении реальных моделей.",
+  "kind": "tts",
+  "entrypoint": "ai_studio_core.plugins.dummy:DummyModel",
+  "compatibility": {
+    "ai_studio_core": ">=0.1.0"
+  },
+  "requirements": [],
+  "models": [],
+  "sha256": null
+}

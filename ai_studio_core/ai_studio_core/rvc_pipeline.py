@@ -1,0 +1,466 @@
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from typing import Optional, Dict, Any
+
+
+# rvc-python/fairseq печатают много служебных INFO и print() прямо в консоль.
+# Глушим их только внутри вызова RVC; собственные краткие строки [RVC] выводим
+# снаружи этого контекста.
+_RVC_NOISY_LOGGER_PREFIXES = ("rvc_python", "fairseq")
+_RVC_NOISE_MARKERS = (
+    "please install tensorboardx",
+    "no supported nvidia gpu found",
+    "using cpu",
+    "use cpu instead",
+    "overwrite preprocess",
+    "is_half:",
+    "loading:",
+)
+
+
+class _DiscardStream:
+    """Незакрываемый sink: безопасен, даже если библиотека запомнит sys.stderr."""
+
+    encoding = "utf-8"
+
+    def write(self, text):
+        return len(text or "")
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+_DISCARD_STREAM = _DiscardStream()
+
+
+def _silence_rvc_loggers():
+    """Оставляет WARNING/ERROR, убирая служебный INFO сторонних RVC-модулей."""
+    names = set(_RVC_NOISY_LOGGER_PREFIXES)
+    try:
+        names.update(
+            name
+            for name in logging.root.manager.loggerDict
+            if isinstance(name, str) and name.startswith(_RVC_NOISY_LOGGER_PREFIXES)
+        )
+    except Exception:
+        pass
+    for name in names:
+        try:
+            logging.getLogger(name).setLevel(logging.WARNING)
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def _quiet_rvc_console():
+    """Подавляет только прямые print()/stderr сторонней RVC-библиотеки."""
+    _silence_rvc_loggers()
+    try:
+        with (
+            contextlib.redirect_stdout(_DISCARD_STREAM),
+            contextlib.redirect_stderr(_DISCARD_STREAM),
+        ):
+            yield
+    finally:
+        # Некоторые дочерние логгеры создаются лениво при первом inference.
+        _silence_rvc_loggers()
+
+
+def _checkpoint_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _trust_path(model_path: str) -> str:
+    return model_path + ".trust.json"
+
+
+def mark_rvc_checkpoint_trusted(model_path: str, source: str = "user-confirmed") -> str:
+    """Persist explicit trust bound to the exact checkpoint SHA-256."""
+    if not os.path.isfile(model_path):
+        raise RVCPipelineError("невозможно подтвердить отсутствующую RVC-модель")
+    digest = _checkpoint_sha256(model_path)
+    record = {
+        "schema": 1,
+        "sha256": digest,
+        "source": str(source or "user-confirmed"),
+        "confirmed_at": int(time.time()),
+    }
+    destination = _trust_path(model_path)
+    temporary = destination + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as output:
+            json.dump(record, output, ensure_ascii=False, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+    return digest
+
+
+def is_rvc_checkpoint_trusted(model_path: str) -> bool:
+    """Trust is invalidated whenever checkpoint bytes change."""
+    try:
+        with open(_trust_path(model_path), "r", encoding="utf-8") as source:
+            record = json.load(source)
+        expected = str(record.get("sha256") or "").lower()
+        return len(expected) == 64 and expected == _checkpoint_sha256(model_path).lower()
+    except Exception:
+        return False
+
+
+def require_rvc_checkpoint_trusted(model_path: str) -> None:
+    if not is_rvc_checkpoint_trusted(model_path):
+        raise RVCPipelineError(
+            "RVC checkpoint не подтверждён пользователем или был изменён после подтверждения"
+        )
+
+
+def _safe_model_paths(models_dir: str, model_name: str) -> tuple[str, str]:
+    """Resolve an extension-less model name without allowing path traversal."""
+    name = str(model_name or "").strip()
+    if (
+        not name
+        or name in (".", "..")
+        or "\x00" in name
+        or any(char in name for char in ("/", "\\", ":"))
+        or name.lower().endswith((".pth", ".index"))
+    ):
+        raise RVCPipelineError("некорректное имя RVC-модели")
+
+    root = os.path.realpath(models_dir)
+    model_path = os.path.realpath(os.path.join(root, f"{name}.pth"))
+    index_path = os.path.realpath(os.path.join(root, f"{name}.index"))
+    try:
+        if os.path.commonpath([root, model_path]) != root:
+            raise RVCPipelineError("путь RVC-модели выходит за пределы каталога моделей")
+        if os.path.commonpath([root, index_path]) != root:
+            raise RVCPipelineError("путь RVC-index выходит за пределы каталога моделей")
+    except ValueError as exc:
+        raise RVCPipelineError("некорректный путь RVC-модели") from exc
+    return model_path, index_path
+
+
+def _validate_rvc_checkpoint(model_path: str):
+    """Рано распознаёт HTML/страницу ошибки, ошибочно сохранённую как .pth."""
+    try:
+        if os.path.getsize(model_path) <= 0:
+            raise RVCPipelineError("файл модели пуст")
+        with open(model_path, "rb") as f:
+            head = f.read(4096).lstrip().lower()
+    except RVCPipelineError:
+        raise
+    except Exception as e:
+        raise RVCPipelineError(f"не удалось прочитать файл модели: {e}")
+
+    if (
+        head.startswith((b"<", b"&lt;", b"<!doctype", b"<?xml"))
+        or b"<html" in head
+        or b"<body" in head
+    ):
+        raise RVCPipelineError("файл модели повреждён: вместо весов .pth сохранена HTML-страница")
+
+
+def _friendly_rvc_error(error: Exception) -> str:
+    text = str(error).strip() or error.__class__.__name__
+    low = text.lower()
+    if "invalid load key" in low and ("'<'" in low or "&lt;" in low):
+        return "файл модели повреждён: вместо весов .pth сохранена HTML-страница"
+    return text
+
+
+def _compact_cli_error(stdout: str, stderr: str) -> str:
+    """Возвращает только последние полезные строки CLI без известного INFO-мусора."""
+    useful = []
+    for line in f"{stdout or ''}\n{stderr or ''}".splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        low = clean.lower()
+        if any(marker in low for marker in _RVC_NOISE_MARKERS):
+            continue
+        useful.append(clean)
+    if not useful:
+        return "подробности отсутствуют"
+    return " | ".join(useful[-3:])[-800:]
+
+
+class RVCPipelineError(Exception):
+    """Exception class for RVC Pipeline errors."""
+
+    pass
+
+
+class RVCNotAvailableError(Exception):
+    """TASK-006: RVC-окружение недоступно (нет CLI-скрипта / нет bundled Python).
+
+    Отдельный класс от RVCPipelineError: это условие «компонент отсутствует», а не
+    ошибка выполнения конвейера — вызывающий код может реагировать иначе (предложить
+    установить RVC, а не показывать traceback конвертации).
+    """
+
+    pass
+
+
+class RVCPostProcessor:
+    """
+    Retrieval-based Voice Conversion (RVC) post-processor for XTTS Studio.
+
+    This class handles the voice conversion layer, taking the raw base voice
+    generated by XTTS v2 and passing it through RVC to significantly enhance
+    the naturalness, timber match, emotional texture, and clarity.
+    """
+
+    def __init__(self, models_dir: str = "models/rvc", device: str = "cuda:0"):
+        self.models_dir = os.path.abspath(models_dir)
+        # rvc-python ожидает вид "cuda:0" / "cpu:0"; "cpu" без суффикса тоже
+        # встречается в наших вызовах — нормализуем.
+        self.device = self._normalize_device(device)
+        os.makedirs(self.models_dir, exist_ok=True)
+
+    @staticmethod
+    def _normalize_device(device: str) -> str:
+        d = (device or "cpu:0").strip().lower()
+        if d in ("cpu", "cpu:0", "cpu0"):
+            return "cpu:0"
+        if d in ("cuda", "gpu"):
+            return "cuda:0"
+        if d.startswith("cuda") and ":" not in d:
+            # "cuda0" → "cuda:0"
+            rest = d[4:]
+            return f"cuda:{rest or '0'}"
+        return device
+
+    def run_inference_via_lib(
+        self,
+        input_path: str,
+        output_path: str,
+        model_name: str,
+        index_rate: float = 0.75,
+        pitch_shift: int = 0,
+        f0_method: str = "rmvpe",
+    ) -> str:
+        """
+        Runs RVC voice conversion using rvc-python while keeping the console clean.
+
+        В консоли остаются только выбранная модель, устройство, параметры,
+        успешное завершение и одна понятная ошибка на уровне вызывающего кода.
+        """
+        model_path, index_path = _safe_model_paths(self.models_dir, model_name)
+
+        if not os.path.exists(model_path):
+            raise RVCPipelineError(f"модель не найдена: {model_path}")
+
+        actual_index_path = index_path if os.path.exists(index_path) else ""
+        device_label = "CPU" if self.device.lower().startswith("cpu") else self.device.upper()
+        method = str(f0_method or "rmvpe")
+
+        print(
+            f"[RVC] Модель: {model_name} | устройство: {device_label} | "
+            f"index: {float(index_rate):.2f} | pitch: {int(pitch_shift):+d} | f0: {method}"
+        )
+        require_rvc_checkpoint_trusted(model_path)
+        _validate_rvc_checkpoint(model_path)
+
+        try:
+            # Импорт ленивый и тоже находится в quiet-контексте: именно здесь
+            # fairseq/rvc-python обычно печатают tensorboardX, CPU и is_half.
+            with _quiet_rvc_console():
+                try:
+                    from rvc_python.infer import RVCInference
+                except ImportError as e:
+                    raise RVCPipelineError(
+                        "библиотека rvc-python не установлена или недоступна"
+                    ) from e
+
+                rvc_engine = RVCInference(device=self.device)
+                rvc_engine.load_model(
+                    model_path,
+                    version="v2",
+                    index_path=actual_index_path,
+                )
+                rvc_engine.set_params(
+                    f0up_key=int(pitch_shift),
+                    f0method=method,
+                    index_rate=float(index_rate),
+                    filter_radius=3,
+                    resample_sr=0,
+                    rms_mix_rate=0.25,
+                    protect=0.33,
+                )
+                rvc_engine.infer_file(input_path, output_path)
+
+            if not os.path.isfile(output_path):
+                raise RVCPipelineError("конвертация завершилась без выходного WAV-файла")
+
+            print(f"[RVC] Конвертация завершена: {os.path.basename(output_path)}")
+            return output_path
+        except RVCPipelineError:
+            raise
+        except TypeError as e:
+            raise RVCPipelineError(
+                "несовместимая версия rvc-python: ожидаются set_params(...) "
+                f"и infer_file(input_path, output_path); {_friendly_rvc_error(e)}"
+            ) from e
+        except Exception as e:
+            raise RVCPipelineError(_friendly_rvc_error(e)) from e
+
+    def run_inference_via_cli(
+        self,
+        input_path: str,
+        output_path: str,
+        model_name: str,
+        pitch_shift: int = 0,
+        f0_method: str = "rmvpe",
+        index_rate: float = 0.75,
+        rvc_cli_dir: str = "tools/RVC_CLI",
+    ) -> str:
+        """
+        Runs RVC conversion via a CLI subprocess call.
+        Ideal for standalone executable environments or pre-built RVC packages.
+        """
+        model_path, index_path = _safe_model_paths(self.models_dir, model_name)
+
+        if not os.path.exists(model_path):
+            raise RVCPipelineError(f"модель не найдена: {model_path}")
+        require_rvc_checkpoint_trusted(model_path)
+        _validate_rvc_checkpoint(model_path)
+        print(
+            f"[RVC] Модель: {model_name} | CLI | index: {float(index_rate):.2f} | "
+            f"pitch: {int(pitch_shift):+d} | f0: {f0_method or 'rmvpe'}"
+        )
+
+        # TASK-006: никакого PATH-fallback («rvc», «python») — только абсолютный путь
+        # к bundled Python (PYTHON_EXE из ai_studio_core.env_core) и обязательный CLI-скрипт.
+        cli_script = os.path.join(rvc_cli_dir, "rvc.py")
+        if not os.path.exists(cli_script):
+            raise RVCNotAvailableError(
+                "RVC CLI не найден: отсутствует tools/RVC_CLI/rvc.py. "
+                "Установите/восстановите RVC-окружение."
+            )
+
+        try:
+            from ai_studio_core import env_core
+
+            python_exe = getattr(env_core, "PYTHON_EXE", None) or sys.executable
+        except Exception:
+            python_exe = sys.executable
+
+        cmd = [
+            os.path.abspath(python_exe),
+            os.path.abspath(cli_script),
+            "infer",
+            "--input_path",
+            input_path,
+            "--output_path",
+            output_path,
+            "--pth_path",
+            model_path,
+            "--f0up_key",
+            str(pitch_shift),
+            "--f0method",
+            f0_method,
+            "--index_rate",
+            str(index_rate),
+        ]
+
+        if os.path.exists(index_path):
+            cmd.extend(["--index_path", index_path])
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8")
+            if not os.path.isfile(output_path):
+                raise RVCPipelineError("CLI завершился без выходного WAV-файла")
+            print(f"[RVC] Конвертация завершена: {os.path.basename(output_path)}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            details = _compact_cli_error(e.stdout, e.stderr)
+            raise RVCPipelineError(f"CLI завершился с кодом {e.returncode}: {details}") from e
+        except RVCPipelineError:
+            raise
+        except FileNotFoundError as e:
+            # bundled Python отсутствует — это «компонент недоступен», а не ошибка RVC
+            raise RVCNotAvailableError(f"не удалось запустить bundled Python: {e}") from e
+        except Exception as e:
+            raise RVCPipelineError(f"не удалось запустить RVC CLI: {e}") from e
+
+
+class XTTSWithRVCPipeline:
+    """
+    A unified orchestration class that chains XTTS v2 generation with RVC voice conversion.
+    """
+
+    def __init__(self, rvc_processor: RVCPostProcessor):
+        self.rvc_processor = rvc_processor
+
+    def generate_and_enhance(
+        self,
+        text: str,
+        language: str,
+        speaker_wav: str,
+        output_path: str,
+        xtts_generator_func,  # callback to generate intermediate audio using XTTS
+        rvc_model: Optional[str] = None,
+        rvc_settings: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Executes the dual-layer pipeline:
+        1. Generates pristine base audio using XTTS v2.
+        2. Post-processes the audio using RVC to enhance realism and similarity.
+        """
+        # If RVC model is not requested, return raw XTTS audio
+        if not rvc_model:
+            return xtts_generator_func(text, language, speaker_wav, output_path)
+
+        # 1. Create a temporary path for the raw XTTS generation
+        base_dir, ext = os.path.splitext(output_path)
+        temp_xtts_output = f"{base_dir}_temp_xtts.wav"
+
+        try:
+            xtts_generator_func(text, language, speaker_wav, temp_xtts_output)
+
+            if not os.path.exists(temp_xtts_output):
+                raise RVCPipelineError("XTTS base generation failed to produce output file.")
+
+            # 2. Apply RVC Voice Conversion
+            # Default settings
+            settings = {"index_rate": 0.75, "pitch_shift": 0, "f0_method": "rmvpe"}
+            if rvc_settings:
+                settings.update(rvc_settings)
+
+            # Convert
+            self.rvc_processor.run_inference_via_lib(
+                input_path=temp_xtts_output,
+                output_path=output_path,
+                model_name=rvc_model,
+                index_rate=settings["index_rate"],
+                pitch_shift=settings["pitch_shift"],
+                f0_method=settings["f0_method"],
+            )
+
+            return output_path
+
+        finally:
+            # Clean up intermediate file
+            if os.path.exists(temp_xtts_output):
+                try:
+                    os.remove(temp_xtts_output)
+                except Exception:
+                    pass
