@@ -58,8 +58,10 @@ from ai_studio_core.env_core.diagnostics import (
     clean_pip_download_cache,
     get_broken_critical,
     get_optional_status,
+    load_diagnostics_cache,
     CRITICAL_COMPONENTS,
     OPTIONAL_COMPONENTS,
+    ML_COMPONENTS,
 )
 
 

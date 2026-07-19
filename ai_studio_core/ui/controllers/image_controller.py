@@ -12,16 +12,18 @@ from PySide6.QtCore import Signal, Slot
 
 from ai_studio_core.i18n import t as tr
 
+from ..diag_bridge import diffusers_available as _diffusers_available_from_cache
 from .base_controller import BaseController
 
 
 def _diffusers_available() -> bool:
-    try:
-        import torch  # noqa: F401
-        import diffusers  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Доступен ли local SD-бэкенд (torch+diffusers)? Проверка по кэшу диагностики.
+
+    Прямой import torch в GUI‑процессе не делаем — битый torch не должен
+    валить окно на старте. Факт наличия torch берём из кэша run_full_diagnostics;
+    diffusers проверяется лёгким импортом (не тянет нативные бинарники).
+    """
+    return _diffusers_available_from_cache()
 
 
 class ImageController(BaseController):

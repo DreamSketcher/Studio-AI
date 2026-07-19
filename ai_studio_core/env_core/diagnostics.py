@@ -28,26 +28,53 @@ SAFE_FILES_CACHE_PATH = os.path.join(PROJECT_ROOT, ".known_safe_files.json")
 DIAG_CACHE_PATH = os.path.join(PROJECT_ROOT, ".env_diagnostics_cache.json")
 
 # ── Классификация компонентов диагностики ──
-# КРИТИЧНЫЕ: без них невозможен вывод аудио TTS или запуск GUI как такового.
-# Именно ЭТИ компоненты имеет смысл считать "неисправными" в смысле,
-# требующем аварийного восстановления/предупреждения пользователя.
+# КРИТИЧНЫЕ: без них GUI не может стартовать как таковое (либо не может
+# выполнить базовый не‑ML функционал — звук espeak, запись истории,
+# криптопроверка релизов и т.п.). ML‑стек (torch, torchaudio, torchvision,
+# TTS = Coqui) СЮДА НЕ ВХОДИТ: в PySide6‑сборке GUI ОБЯЗАН открываться и
+# работать через espeak‑fallback, даже если весь ML‑стек отсутствует или
+# битый. Неработающий torch/TTS — это недоступная фича, а не падение GUI.
 CRITICAL_COMPONENTS = {
     "numpy",
-    "torch",
-    "torchaudio",
-    "torchvision",
-    "tts",
     "soundfile",
     "pygame",
-    "customtkinter",
     "num2words",
     "cryptography",
 }
-# ОПЦИОНАЛЬНЫЕ: дополнительные фичи (локальный LLM-чат, конвертация голоса).
-# Их отсутствие — это НОРМАЛЬНОЕ состояние по умолчанию (пользователь просто
-# ещё не устанавливал их), а не поломка. Не должны помечаться как
-# "неисправный компонент" только потому что не установлены.
-OPTIONAL_COMPONENTS = {"llama_cpp", "rvc_python"}
+# ML‑компоненты: не критичны для запуска GUI, но используются в воркерах
+# при наличии. Их наличие определяется по кэшу диагностики и не должно
+# проверяться синхронным import'ом в GUI‑процессе на старте.
+ML_COMPONENTS = {"torch", "torchaudio", "torchvision", "tts"}
+# ОПЦИОНАЛЬНЫЕ: дополнительные фичи (локальный LLM-чат, конвертация голоса,
+# customtkinter оставлен для совместимости со старыми запусками tkinter).
+# Их отсутствие — это НОРМАЛЬНОЕ состояние по умолчанию.
+OPTIONAL_COMPONENTS = {"llama_cpp", "rvc_python", "customtkinter"}
+
+
+def load_diagnostics_cache() -> dict:
+    """
+    Безопасно читает закэшированный результат run_full_diagnostics().
+    Никогда не импортирует torch/tts и не запускает подпроцессов — только
+    читает JSON с диска. Если кэша нет или он битый — возвращает пустой
+    словарь (caller должен трактовать это как "ещё не известно / недоступно").
+
+    Используется в GUI-слое вместо синхронного import torch на старте окна.
+    """
+    if not os.path.exists(DIAG_CACHE_PATH):
+        return {}
+    try:
+        with open(DIAG_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("results"), dict):
+            return data["results"]
+    except Exception as e:
+        write_log(f"[Diagnostics] Не удалось прочитать кэш диагностики: {e}")
+    return {}
+
+
+def _component_ok(results: dict, name: str) -> bool:
+    """True, если в кэше компонент отмечен как работающий (True)."""
+    return bool(results) and results.get(name) is True
 
 
 def get_broken_critical(results: dict) -> list:

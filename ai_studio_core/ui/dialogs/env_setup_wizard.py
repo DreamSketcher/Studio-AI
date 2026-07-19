@@ -51,26 +51,56 @@ def _check_module(module: str, hint: str) -> tuple[bool, str]:
 
 
 def _check_cuda() -> tuple[bool, str]:
+    """Проверка CUDA по кэшу диагностики (без импорта torch в GUI‑процессе).
+
+    Чтобы не провоцировать падение GUI битым torch'ом, мы НЕ импортируем
+    torch здесь. Факт наличия CUDA определяется через кэш
+    run_full_diagnostics() и через DiagnosticsBridge, который определяет
+    CUDA в фоне после подтверждения, что torch импортируется.
+    """
     try:
-        import torch
-    except Exception:
-        return False, "torch не установлен — CUDA недоступна"
-    try:
-        if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0)
+        from ..diag_bridge import get_bridge
+        bridge = get_bridge()
+        if not bridge.component_ok("torch"):
+            return False, "torch не установлен (или не прошёл диагностику) — CUDA недоступна"
+        if bridge.cuda_available():
+            name = bridge.cuda_device_name() or "CUDA"
             return True, f"CUDA доступна: {name}"
         return False, "torch установлен, но CUDA-устройств нет (режим CPU)"
     except Exception as e:
         return False, f"проверка CUDA не удалась: {e}"
 
 
+def _check_module_from_cache(module: str, hint: str) -> tuple[bool, str]:
+    """Проверка модуля ML‑стека (torch/TTS/diffusers) через кэш диагностики.
+
+    Прямой __import__(module) в GUI‑процессе для torch/TTS опасен — нативные
+    библиотеки могут убить процесс без исключения. Поэтому для этих модулей
+    опираемся на результаты run_full_diagnostics() (которая проверяет
+    импорт в изолированном сабпроцессе). Для других модулей (не ML) можно
+    использовать обычный _check_module.
+    """
+    diag_key = {"torch": "torch", "TTS": "tts"}.get(module)
+    if diag_key is not None:
+        try:
+            from ..diag_bridge import get_bridge
+            ok = get_bridge().component_ok(diag_key)
+        except Exception:
+            ok = False
+        if ok:
+            return True, f"{module} доступен (по диагностике)"
+        return False, f"{module} не установлен ({hint})"
+    # diffusers и прочие не‑torch модули — лёгкий import, не валит процесс
+    return _check_module(module, hint)
+
+
 # name → (функция проверки, подсказка). Только реально измеримое.
 CHECKS = {
     "ffmpeg": (_check_ffmpeg,),
     "espeak-ng": (_check_espeak,),
-    "torch": (lambda: _check_module("torch", "pip install torch"),),
-    "Coqui TTS": (lambda: _check_module("TTS", "pip install -e \".[ml]\""),),
-    "diffusers": (lambda: _check_module("diffusers", "pip install diffusers"),),
+    "torch": (lambda: _check_module_from_cache("torch", "pip install torch"),),
+    "Coqui TTS": (lambda: _check_module_from_cache("TTS", "pip install -e \".[ml]\""),),
+    "diffusers": (lambda: _check_module_from_cache("diffusers", "pip install diffusers"),),
     "CUDA": (_check_cuda,),
 }
 

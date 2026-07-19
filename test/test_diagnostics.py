@@ -27,19 +27,38 @@ def tmp_base(tmp_path, monkeypatch):
 
 class TestBrokenCritical:
     def test_broken(self):
+        # ML-компоненты (torch/torchaudio/torchvision/tts) больше не входят
+        # в CRITICAL_COMPONENTS: GUI на PySide6 обязан стартовать и без них,
+        # с fallback на espeak. Битый torch = недоступная фича, а не падение GUI.
         results = {
             "numpy": True,
-            "torch": "error",
-            "tts": "SKIPPED: ожидает починки numpy",
-            "llama_cpp": "error",  # optional
-            "rvc_python": "error",  # optional
+            "torch": "error",          # ML — не критичный для GUI
+            "tts": "SKIPPED: ожидает починки numpy",  # ML — не критичный
+            "torchaudio": "error",     # ML — не критичный
+            "torchvision": "error",    # ML — не критичный
+            "llama_cpp": "error",      # optional
+            "rvc_python": "error",     # optional
+            "customtkinter": "error",  # optional (для tkinter legacy)
             "soundfile": True,
+            "pygame": "error",         # реально критичный для GUI-звука
+            "num2words": True,
+            "cryptography": True,
         }
         broken = diag.get_broken_critical(results)
-        assert "torch" in broken
-        assert "tts" not in broken  # SKIPPED
-        assert "llama_cpp" not in broken  # optional
+        # torch/tts/torchaudio/torchvision — ML, не входят в critical
+        assert "torch" not in broken
+        assert "tts" not in broken
+        assert "torchaudio" not in broken
+        assert "torchvision" not in broken
+        # SKIPPED не считается поломкой
+        # optional не входят
+        assert "llama_cpp" not in broken
+        assert "rvc_python" not in broken
+        assert "customtkinter" not in broken
+        # numpy — рабочий, не в списке
         assert "numpy" not in broken
+        # битый звуковой компонент — в списке
+        assert "pygame" in broken
 
     def test_optional_status(self):
         results = {

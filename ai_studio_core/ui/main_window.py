@@ -20,7 +20,7 @@ Layout:
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QSettings, Qt
+from PySide6.QtCore import QByteArray, QSettings, Qt, Slot
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget, QMainWindow, QTabWidget, QWidget,
@@ -33,6 +33,7 @@ from .controllers import (
     ChatController, ImageController, ModelController, QueueController,
     TTSController,
 )
+from .diag_bridge import get_bridge
 from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
 from .panels import (
     HistoryPanel, InspectorPanel, ModelHubPanel, QueuePanel, SettingsPanel,
@@ -84,7 +85,15 @@ class MainWindow(QMainWindow):
         self._wire_settings()
         self._restore_layout()
 
+        # Подписываемся на окончание фоновой диагностики — тогда селекторы
+        # моделей и комбобокс устройства обновятся, а статус‑бар начнёт
+        # показывать GPU/VRAM. Прямого import torch в __init__ нет.
+        bridge = get_bridge()
+        bridge.diagnostics_updated.connect(self._on_diagnostics_updated)
+        # Запускаем фоновую диагностику ПОСЛЕ показа окна (singleShot 0),
+        # чтобы окно успело отрисоваться до того как subprocess стартанёт.
         from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
         QTimer.singleShot(300, lambda: self._toast(tr("msg_welcome"), "info"))
 
     # ── Menu ──
@@ -566,6 +575,23 @@ class MainWindow(QMainWindow):
 
     def _on_about(self) -> None:
         AboutDialog(self).exec()
+
+    # ── Diagnostics refresh callback ──
+    @Slot()
+    def _on_diagnostics_updated(self) -> None:
+        """Фоновая диагностика завершилась — перезаполняем селекторы,
+        которые зависят от доступности coqui/diffusers/CUDA."""
+        try:
+            # TTS backend selector
+            tts_sel = self._tts_workspace.model_selector()
+            tts_sel.set_models(self._tts_ctrl.available_models())
+            # Image backend selector
+            self._image_workspace.model_selector().set_models(
+                self._image_ctrl.available_models())
+            # CUDA option в settings
+            self._settings_widget.refresh_device_options()
+        except Exception as e:
+            self._log_widget.append("WARN", f"diagnostics UI refresh failed: {e}")
 
     # ── Toast helper ──
     def _toast(self, message: str, variant: str = "info") -> None:

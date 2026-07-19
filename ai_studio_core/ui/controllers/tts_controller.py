@@ -18,18 +18,22 @@ from PySide6.QtCore import Signal, Slot
 
 from ai_studio_core.i18n import t as tr
 
+from ..diag_bridge import coqui_available as _coqui_available_from_cache
 from .base_controller import BaseController
 
 CHUNK_SILENCE_MS = 150  # пауза между склеенными чанками
 
 
 def _coqui_available() -> bool:
-    try:
-        import torch  # noqa: F401
-        import TTS    # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Coqui (torch+TTS) доступен? Проверка по кэшу диагностики (НЕ импортирует torch).
+
+    Важно: проверка идёт через закэшированный результат env_core.diagnostics
+    run_full_diagnostics(), а не через прямой import torch в GUI‑процессе.
+    Битый torch на старте окна не должен убивать GUI — окно стартует,
+    coqui отображается как "download" (недоступен), а диагностика работает
+    в фоне и обновляет статус когда придёт.
+    """
+    return _coqui_available_from_cache()
 
 
 def _detect_backend() -> str | None:

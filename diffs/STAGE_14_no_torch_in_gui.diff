@@ -1,0 +1,729 @@
+diff --git a/ai_studio_core/env_core/__init__.py b/ai_studio_core/env_core/__init__.py
+index fb9286e..0715c77 100644
+--- a/ai_studio_core/env_core/__init__.py
++++ b/ai_studio_core/env_core/__init__.py
+@@ -58,8 +58,10 @@ from ai_studio_core.env_core.diagnostics import (
+     clean_pip_download_cache,
+     get_broken_critical,
+     get_optional_status,
++    load_diagnostics_cache,
+     CRITICAL_COMPONENTS,
+     OPTIONAL_COMPONENTS,
++    ML_COMPONENTS,
+ )
+ 
+ 
+diff --git a/ai_studio_core/env_core/diagnostics.py b/ai_studio_core/env_core/diagnostics.py
+index e100b79..f44c7cf 100644
+--- a/ai_studio_core/env_core/diagnostics.py
++++ b/ai_studio_core/env_core/diagnostics.py
+@@ -28,26 +28,53 @@ SAFE_FILES_CACHE_PATH = os.path.join(PROJECT_ROOT, ".known_safe_files.json")
+ DIAG_CACHE_PATH = os.path.join(PROJECT_ROOT, ".env_diagnostics_cache.json")
+ 
+ # ── Классификация компонентов диагностики ──
+-# КРИТИЧНЫЕ: без них невозможен вывод аудио TTS или запуск GUI как такового.
+-# Именно ЭТИ компоненты имеет смысл считать "неисправными" в смысле,
+-# требующем аварийного восстановления/предупреждения пользователя.
++# КРИТИЧНЫЕ: без них GUI не может стартовать как таковое (либо не может
++# выполнить базовый не‑ML функционал — звук espeak, запись истории,
++# криптопроверка релизов и т.п.). ML‑стек (torch, torchaudio, torchvision,
++# TTS = Coqui) СЮДА НЕ ВХОДИТ: в PySide6‑сборке GUI ОБЯЗАН открываться и
++# работать через espeak‑fallback, даже если весь ML‑стек отсутствует или
++# битый. Неработающий torch/TTS — это недоступная фича, а не падение GUI.
+ CRITICAL_COMPONENTS = {
+     "numpy",
+-    "torch",
+-    "torchaudio",
+-    "torchvision",
+-    "tts",
+     "soundfile",
+     "pygame",
+-    "customtkinter",
+     "num2words",
+     "cryptography",
+ }
+-# ОПЦИОНАЛЬНЫЕ: дополнительные фичи (локальный LLM-чат, конвертация голоса).
+-# Их отсутствие — это НОРМАЛЬНОЕ состояние по умолчанию (пользователь просто
+-# ещё не устанавливал их), а не поломка. Не должны помечаться как
+-# "неисправный компонент" только потому что не установлены.
+-OPTIONAL_COMPONENTS = {"llama_cpp", "rvc_python"}
++# ML‑компоненты: не критичны для запуска GUI, но используются в воркерах
++# при наличии. Их наличие определяется по кэшу диагностики и не должно
++# проверяться синхронным import'ом в GUI‑процессе на старте.
++ML_COMPONENTS = {"torch", "torchaudio", "torchvision", "tts"}
++# ОПЦИОНАЛЬНЫЕ: дополнительные фичи (локальный LLM-чат, конвертация голоса,
++# customtkinter оставлен для совместимости со старыми запусками tkinter).
++# Их отсутствие — это НОРМАЛЬНОЕ состояние по умолчанию.
++OPTIONAL_COMPONENTS = {"llama_cpp", "rvc_python", "customtkinter"}
++
++
++def load_diagnostics_cache() -> dict:
++    """
++    Безопасно читает закэшированный результат run_full_diagnostics().
++    Никогда не импортирует torch/tts и не запускает подпроцессов — только
++    читает JSON с диска. Если кэша нет или он битый — возвращает пустой
++    словарь (caller должен трактовать это как "ещё не известно / недоступно").
++
++    Используется в GUI-слое вместо синхронного import torch на старте окна.
++    """
++    if not os.path.exists(DIAG_CACHE_PATH):
++        return {}
++    try:
++        with open(DIAG_CACHE_PATH, "r", encoding="utf-8") as f:
++            data = json.load(f)
++        if isinstance(data, dict) and isinstance(data.get("results"), dict):
++            return data["results"]
++    except Exception as e:
++        write_log(f"[Diagnostics] Не удалось прочитать кэш диагностики: {e}")
++    return {}
++
++
++def _component_ok(results: dict, name: str) -> bool:
++    """True, если в кэше компонент отмечен как работающий (True)."""
++    return bool(results) and results.get(name) is True
+ 
+ 
+ def get_broken_critical(results: dict) -> list:
+diff --git a/ai_studio_core/ui/controllers/image_controller.py b/ai_studio_core/ui/controllers/image_controller.py
+index 1ffe102..d71feb6 100644
+--- a/ai_studio_core/ui/controllers/image_controller.py
++++ b/ai_studio_core/ui/controllers/image_controller.py
+@@ -12,16 +12,18 @@ from PySide6.QtCore import Signal, Slot
+ 
+ from ai_studio_core.i18n import t as tr
+ 
++from ..diag_bridge import diffusers_available as _diffusers_available_from_cache
+ from .base_controller import BaseController
+ 
+ 
+ def _diffusers_available() -> bool:
+-    try:
+-        import torch  # noqa: F401
+-        import diffusers  # noqa: F401
+-        return True
+-    except Exception:
+-        return False
++    """Доступен ли local SD-бэкенд (torch+diffusers)? Проверка по кэшу диагностики.
++
++    Прямой import torch в GUI‑процессе не делаем — битый torch не должен
++    валить окно на старте. Факт наличия torch берём из кэша run_full_diagnostics;
++    diffusers проверяется лёгким импортом (не тянет нативные бинарники).
++    """
++    return _diffusers_available_from_cache()
+ 
+ 
+ class ImageController(BaseController):
+diff --git a/ai_studio_core/ui/controllers/tts_controller.py b/ai_studio_core/ui/controllers/tts_controller.py
+index fe7084e..8550915 100644
+--- a/ai_studio_core/ui/controllers/tts_controller.py
++++ b/ai_studio_core/ui/controllers/tts_controller.py
+@@ -18,18 +18,22 @@ from PySide6.QtCore import Signal, Slot
+ 
+ from ai_studio_core.i18n import t as tr
+ 
++from ..diag_bridge import coqui_available as _coqui_available_from_cache
+ from .base_controller import BaseController
+ 
+ CHUNK_SILENCE_MS = 150  # пауза между склеенными чанками
+ 
+ 
+ def _coqui_available() -> bool:
+-    try:
+-        import torch  # noqa: F401
+-        import TTS    # noqa: F401
+-        return True
+-    except Exception:
+-        return False
++    """Coqui (torch+TTS) доступен? Проверка по кэшу диагностики (НЕ импортирует torch).
++
++    Важно: проверка идёт через закэшированный результат env_core.diagnostics
++    run_full_diagnostics(), а не через прямой import torch в GUI‑процессе.
++    Битый torch на старте окна не должен убивать GUI — окно стартует,
++    coqui отображается как "download" (недоступен), а диагностика работает
++    в фоне и обновляет статус когда придёт.
++    """
++    return _coqui_available_from_cache()
+ 
+ 
+ def _detect_backend() -> str | None:
+diff --git a/ai_studio_core/ui/dialogs/env_setup_wizard.py b/ai_studio_core/ui/dialogs/env_setup_wizard.py
+index 311fe89..f629be1 100644
+--- a/ai_studio_core/ui/dialogs/env_setup_wizard.py
++++ b/ai_studio_core/ui/dialogs/env_setup_wizard.py
+@@ -51,26 +51,56 @@ def _check_module(module: str, hint: str) -> tuple[bool, str]:
+ 
+ 
+ def _check_cuda() -> tuple[bool, str]:
++    """Проверка CUDA по кэшу диагностики (без импорта torch в GUI‑процессе).
++
++    Чтобы не провоцировать падение GUI битым torch'ом, мы НЕ импортируем
++    torch здесь. Факт наличия CUDA определяется через кэш
++    run_full_diagnostics() и через DiagnosticsBridge, который определяет
++    CUDA в фоне после подтверждения, что torch импортируется.
++    """
+     try:
+-        import torch
+-    except Exception:
+-        return False, "torch не установлен — CUDA недоступна"
+-    try:
+-        if torch.cuda.is_available():
+-            name = torch.cuda.get_device_name(0)
++        from ..diag_bridge import get_bridge
++        bridge = get_bridge()
++        if not bridge.component_ok("torch"):
++            return False, "torch не установлен (или не прошёл диагностику) — CUDA недоступна"
++        if bridge.cuda_available():
++            name = bridge.cuda_device_name() or "CUDA"
+             return True, f"CUDA доступна: {name}"
+         return False, "torch установлен, но CUDA-устройств нет (режим CPU)"
+     except Exception as e:
+         return False, f"проверка CUDA не удалась: {e}"
+ 
+ 
++def _check_module_from_cache(module: str, hint: str) -> tuple[bool, str]:
++    """Проверка модуля ML‑стека (torch/TTS/diffusers) через кэш диагностики.
++
++    Прямой __import__(module) в GUI‑процессе для torch/TTS опасен — нативные
++    библиотеки могут убить процесс без исключения. Поэтому для этих модулей
++    опираемся на результаты run_full_diagnostics() (которая проверяет
++    импорт в изолированном сабпроцессе). Для других модулей (не ML) можно
++    использовать обычный _check_module.
++    """
++    diag_key = {"torch": "torch", "TTS": "tts"}.get(module)
++    if diag_key is not None:
++        try:
++            from ..diag_bridge import get_bridge
++            ok = get_bridge().component_ok(diag_key)
++        except Exception:
++            ok = False
++        if ok:
++            return True, f"{module} доступен (по диагностике)"
++        return False, f"{module} не установлен ({hint})"
++    # diffusers и прочие не‑torch модули — лёгкий import, не валит процесс
++    return _check_module(module, hint)
++
++
+ # name → (функция проверки, подсказка). Только реально измеримое.
+ CHECKS = {
+     "ffmpeg": (_check_ffmpeg,),
+     "espeak-ng": (_check_espeak,),
+-    "torch": (lambda: _check_module("torch", "pip install torch"),),
+-    "Coqui TTS": (lambda: _check_module("TTS", "pip install -e \".[ml]\""),),
+-    "diffusers": (lambda: _check_module("diffusers", "pip install diffusers"),),
++    "torch": (lambda: _check_module_from_cache("torch", "pip install torch"),),
++    "Coqui TTS": (lambda: _check_module_from_cache("TTS", "pip install -e \".[ml]\""),),
++    "diffusers": (lambda: _check_module_from_cache("diffusers", "pip install diffusers"),),
+     "CUDA": (_check_cuda,),
+ }
+ 
+diff --git a/ai_studio_core/ui/main_window.py b/ai_studio_core/ui/main_window.py
+index f777ac8..6021cfb 100644
+--- a/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ui/main_window.py
+@@ -20,7 +20,7 @@ Layout:
+ """
+ from __future__ import annotations
+ 
+-from PySide6.QtCore import QByteArray, QSettings, Qt
++from PySide6.QtCore import QByteArray, QSettings, Qt, Slot
+ from PySide6.QtGui import QAction, QKeySequence
+ from PySide6.QtWidgets import (
+     QDockWidget, QMainWindow, QTabWidget, QWidget,
+@@ -33,6 +33,7 @@ from .controllers import (
+     ChatController, ImageController, ModelController, QueueController,
+     TTSController,
+ )
++from .diag_bridge import get_bridge
+ from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
+ from .panels import (
+     HistoryPanel, InspectorPanel, ModelHubPanel, QueuePanel, SettingsPanel,
+@@ -84,7 +85,15 @@ class MainWindow(QMainWindow):
+         self._wire_settings()
+         self._restore_layout()
+ 
++        # Подписываемся на окончание фоновой диагностики — тогда селекторы
++        # моделей и комбобокс устройства обновятся, а статус‑бар начнёт
++        # показывать GPU/VRAM. Прямого import torch в __init__ нет.
++        bridge = get_bridge()
++        bridge.diagnostics_updated.connect(self._on_diagnostics_updated)
++        # Запускаем фоновую диагностику ПОСЛЕ показа окна (singleShot 0),
++        # чтобы окно успело отрисоваться до того как subprocess стартанёт.
+         from PySide6.QtCore import QTimer
++        QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
+         QTimer.singleShot(300, lambda: self._toast(tr("msg_welcome"), "info"))
+ 
+     # ── Menu ──
+@@ -567,6 +576,23 @@ class MainWindow(QMainWindow):
+     def _on_about(self) -> None:
+         AboutDialog(self).exec()
+ 
++    # ── Diagnostics refresh callback ──
++    @Slot()
++    def _on_diagnostics_updated(self) -> None:
++        """Фоновая диагностика завершилась — перезаполняем селекторы,
++        которые зависят от доступности coqui/diffusers/CUDA."""
++        try:
++            # TTS backend selector
++            tts_sel = self._tts_workspace.model_selector()
++            tts_sel.set_models(self._tts_ctrl.available_models())
++            # Image backend selector
++            self._image_workspace.model_selector().set_models(
++                self._image_ctrl.available_models())
++            # CUDA option в settings
++            self._settings_widget.refresh_device_options()
++        except Exception as e:
++            self._log_widget.append("WARN", f"diagnostics UI refresh failed: {e}")
++
+     # ── Toast helper ──
+     def _toast(self, message: str, variant: str = "info") -> None:
+         t_ = Toast(message, variant=variant, duration_ms=3000, parent=self)
+diff --git a/ai_studio_core/ui/panels/settings_panel.py b/ai_studio_core/ui/panels/settings_panel.py
+index c058766..d159970 100644
+--- a/ai_studio_core/ui/panels/settings_panel.py
++++ b/ai_studio_core/ui/panels/settings_panel.py
+@@ -14,15 +14,20 @@ from PySide6.QtWidgets import (
+ 
+ from ai_studio_core.i18n import LANGUAGES, t as tr
+ 
++from ..diag_bridge import get_bridge
+ from ..theme.tokens import TOKENS
+ from ..widgets.collapsible_group import CollapsibleGroup
+ 
+ 
+ def _cuda_available() -> bool:
+-    """CUDA есть только если установлен torch и видит GPU. Без torch — честно скрываем."""
++    """CUDA есть только если диагностика подтвердила рабочий torch и видимый GPU.
++
++    Прямой import torch в GUI‑процессе на старте окна не делаем — битый
++    torch может убить процесс до window.show(). После завершения фоновой
++    диагностики bridge обновит статус и панель перестроит комбобокс.
++    """
+     try:
+-        import torch
+-        return bool(torch.cuda.is_available())
++        return get_bridge().cuda_available()
+     except Exception:
+         return False
+ 
+@@ -70,12 +75,9 @@ class SettingsPanel(QWidget):
+         self._perf_group = CollapsibleGroup("")
+         perf_form = QFormLayout()
+         self._device = QComboBox()
+-        self._device.addItem(tr("device_auto"), userData="auto")
+-        self._device.addItem("CPU", userData="cpu")
+-        if _cuda_available():
+-            self._device.addItem("CUDA", userData="cuda")
+         self._device_lbl = QLabel()
+         perf_form.addRow(self._device_lbl, self._device)
++        self._rebuild_device_combo()
+ 
+         self._threads = QSpinBox()
+         self._threads.setRange(1, 32)
+@@ -160,6 +162,26 @@ class SettingsPanel(QWidget):
+ 
+         self.retranslate_ui()
+ 
++    def _rebuild_device_combo(self) -> None:
++        """Перестроить комбобокс устройства после получения диагностики CUDA."""
++        current = self._device.currentData() if self._device.count() else "auto"
++        self._device.blockSignals(True)
++        self._device.clear()
++        self._device.addItem(tr("device_auto"), userData="auto")
++        self._device.addItem("CPU", userData="cpu")
++        if _cuda_available():
++            name = get_bridge().cuda_device_name() or "CUDA"
++            self._device.addItem(f"CUDA — {name}", userData="cuda")
++        # Вернуть предыдущий выбор (если его нет — auto)
++        idx = self._device.findData(current)
++        if idx >= 0:
++            self._device.setCurrentIndex(idx)
++        self._device.blockSignals(False)
++
++    def refresh_device_options(self) -> None:
++        """Публичный слот для подписки на diagnostics_updated / cuda_info_changed."""
++        self._rebuild_device_combo()
++
+     # ── Public API ──
+ 
+     def current_settings(self) -> dict:
+diff --git a/ai_studio_core/ui/widgets/status_bar.py b/ai_studio_core/ui/widgets/status_bar.py
+index 7f543ca..0ff5132 100644
+--- a/ai_studio_core/ui/widgets/status_bar.py
++++ b/ai_studio_core/ui/widgets/status_bar.py
+@@ -2,7 +2,12 @@
+ 
+ Честность показателей:
+   * CPU/RAM — psutil (реальные, раз в 2 с);
+-  * GPU/VRAM — только если установлен torch и есть CUDA; иначе «—»;
++  * GPU/VRAM — только если диагностика подтвердила рабочий torch+CUDA;
++               сам torch импортируется ЛЕНИВО, при первой удачной пробе,
++               в методе _ensure_torch_probe() и только в момент таймера
++               (НЕ на конструкторе и не на старте окна). Если импорт упал —
++               индикаторы остаются в «—» и больше не пытаются до следующего
++               процесса; это не мешает запуску GUI.
+   * Queue — реальное число задач из QueueController (set_queue_size).
+ """
+ from __future__ import annotations
+@@ -10,6 +15,7 @@ from __future__ import annotations
+ from PySide6.QtCore import QTimer
+ from PySide6.QtWidgets import QLabel, QStatusBar, QWidget
+ 
++from ..diag_bridge import get_bridge
+ from ..theme.tokens import TOKENS
+ 
+ 
+@@ -38,11 +44,26 @@ class ResourceStatusBar(QStatusBar):
+                   self._ram_label, self._queue_label):
+             self.addPermanentWidget(w)
+ 
++        # Торч импортируем ЛЕНИВО и только после подтверждения, что он
++        # рабочий (через кэш диагностики). Пока флаг _torch_loaded = False —
++        # даже и не пытаемся дёргать нативные библиотеки на таймере.
++        self._torch = None
++        self._torch_load_attempted = False
++        self._torch_load_failed = False
++
+         self._poll_timer = QTimer(self)
+         self._poll_timer.setInterval(2000)
+         self._poll_timer.timeout.connect(self._poll_resources)
+         self._poll_timer.start()
+ 
++        # Подписываемся на обновление диагностики — когда в фоне
++        # подтвердится наличие CUDA, статус‑бар начнёт показывать GPU/VRAM.
++        try:
++            get_bridge().diagnostics_updated.connect(self._on_diag_updated)
++            get_bridge().cuda_info_changed.connect(self._on_cuda_info_changed)
++        except Exception:
++            pass
++
+     def set_message(self, text: str) -> None:
+         self._message_label.setText(text)
+ 
+@@ -85,8 +106,50 @@ class ResourceStatusBar(QStatusBar):
+             return TOKENS.colors.accent_warning
+         return TOKENS.colors.accent_error
+ 
++    def _on_diag_updated(self) -> None:
++        """Сбросить флаг неудачной попытки после того как кэш обновился."""
++        self._torch_load_attempted = False
++        self._torch_load_failed = False
++
++    def _on_cuda_info_changed(self, available: bool, _name: str) -> None:
++        if not available:
++            # CUDA нет — явно сбрасываем индикаторы на «—»
++            self._gpu_label.setText("GPU: —")
++            self._vram_label.setText("VRAM: — / —")
++
++    def _ensure_torch(self):
++        """Ленивый импорт torch в момент _poll_resources (т.е. на таймере,
++        ПОСЛЕ того как окно уже показано и диагностика успела подтвердить,
++        что torch рабочий). Даже если импорт упадёт — это произойдёт в
++        основном цикле событий в обработчике таймера, а не в __init__,
++        и будет поймано в try/except ниже; индикаторы просто останутся «—».
++        """
++        if self._torch is not None:
++            return self._torch
++        if self._torch_load_failed:
++            return None
++        if self._torch_load_attempted:
++            return None
++        # Прежде чем тянуть нативный torch в этом процессе, проверяем,
++        # что диагностика посчитала его рабочим. Если в кэше torch ещё не
++        # подтверждён — не рискуем, ждём.
++        try:
++            if not get_bridge().component_ok("torch"):
++                return None
++        except Exception:
++            return None
++        self._torch_load_attempted = True
++        try:
++            import torch  # noqa: F811 — умышленно ленивый импорт
++            self._torch = torch
++            return torch
++        except Exception:
++            self._torch_load_failed = True
++            return None
++
+     def _poll_resources(self) -> None:
+-        """Опрос CPU/RAM раз в 2 с. GPU/VRAM — только если torch+CUDA реально есть."""
++        """Опрос CPU/RAM раз в 2 с. GPU/VRAM — только если torch+CUDA реально есть,
++        и только ПОСЛЕ того как диагностика подтвердила рабочий torch в фоне."""
+         try:
+             import psutil
+             self._cpu_label.setText(f"CPU: {psutil.cpu_percent(interval=None):.0f}%")
+@@ -94,17 +157,21 @@ class ResourceStatusBar(QStatusBar):
+             self._ram_label.setText(f"RAM: {mem.percent:.0f}%")
+         except Exception:
+             pass
++
++        torch = self._ensure_torch()
++        if torch is None:
++            return
+         try:
+-            import torch
+-            if torch.cuda.is_available():
+-                dev = torch.cuda.current_device()
+-                used = torch.cuda.memory_allocated(dev) / 1024**3
+-                total = torch.cuda.get_device_properties(dev).total_memory / 1024**3
+-                pct = int(used / total * 100) if total > 0 else 0
+-                color = self._utilization_color(pct)
+-                self._gpu_label.setText(f"GPU: {pct}%")
+-                self._gpu_label.setStyleSheet(f"color: {color}; border: none; padding: 0 8px;")
+-                self._vram_label.setText(f"VRAM: {used:.1f}/{total:.1f} GB")
+-                self._vram_label.setStyleSheet(f"color: {color}; border: none; padding: 0 8px;")
++            if not torch.cuda.is_available():
++                return
++            dev = torch.cuda.current_device()
++            used = torch.cuda.memory_allocated(dev) / 1024**3
++            total = torch.cuda.get_device_properties(dev).total_memory / 1024**3
++            pct = int(used / total * 100) if total > 0 else 0
++            color = self._utilization_color(pct)
++            self._gpu_label.setText(f"GPU: {pct}%")
++            self._gpu_label.setStyleSheet(f"color: {color}; border: none; padding: 0 8px;")
++            self._vram_label.setText(f"VRAM: {used:.1f}/{total:.1f} GB")
++            self._vram_label.setStyleSheet(f"color: {color}; border: none; padding: 0 8px;")
+         except Exception:
+             pass
+diff --git a/test/test_diagnostics.py b/test/test_diagnostics.py
+index 982f5b8..bbbc3b6 100644
+--- a/test/test_diagnostics.py
++++ b/test/test_diagnostics.py
+@@ -27,19 +27,38 @@ def tmp_base(tmp_path, monkeypatch):
+ 
+ class TestBrokenCritical:
+     def test_broken(self):
++        # ML-компоненты (torch/torchaudio/torchvision/tts) больше не входят
++        # в CRITICAL_COMPONENTS: GUI на PySide6 обязан стартовать и без них,
++        # с fallback на espeak. Битый torch = недоступная фича, а не падение GUI.
+         results = {
+             "numpy": True,
+-            "torch": "error",
+-            "tts": "SKIPPED: ожидает починки numpy",
+-            "llama_cpp": "error",  # optional
+-            "rvc_python": "error",  # optional
++            "torch": "error",          # ML — не критичный для GUI
++            "tts": "SKIPPED: ожидает починки numpy",  # ML — не критичный
++            "torchaudio": "error",     # ML — не критичный
++            "torchvision": "error",    # ML — не критичный
++            "llama_cpp": "error",      # optional
++            "rvc_python": "error",     # optional
++            "customtkinter": "error",  # optional (для tkinter legacy)
+             "soundfile": True,
++            "pygame": "error",         # реально критичный для GUI-звука
++            "num2words": True,
++            "cryptography": True,
+         }
+         broken = diag.get_broken_critical(results)
+-        assert "torch" in broken
+-        assert "tts" not in broken  # SKIPPED
+-        assert "llama_cpp" not in broken  # optional
++        # torch/tts/torchaudio/torchvision — ML, не входят в critical
++        assert "torch" not in broken
++        assert "tts" not in broken
++        assert "torchaudio" not in broken
++        assert "torchvision" not in broken
++        # SKIPPED не считается поломкой
++        # optional не входят
++        assert "llama_cpp" not in broken
++        assert "rvc_python" not in broken
++        assert "customtkinter" not in broken
++        # numpy — рабочий, не в списке
+         assert "numpy" not in broken
++        # битый звуковой компонент — в списке
++        assert "pygame" in broken
+ 
+     def test_optional_status(self):
+         results = {
+--- Новый файл: ai_studio_core/ui/diag_bridge.py ---
+diff --git a/ai_studio_core/ui/diag_bridge.py b/ai_studio_core/ui/diag_bridge.py
+new file mode 100644
+--- /dev/null
++++ b/ai_studio_core/ui/diag_bridge.py
++# -*- coding: utf-8 -*-
++"""ui/diag_bridge.py — мост между GUI и env_core.diagnostics.
++
++Назначение:
++  * Дать GUI‑слою синхронные, НЕ ИМПОРТИРУЮЩИЕ torch/TTS предикаты
++    вида coqui_available() / diffusers_available(), работающие поверх
++    закэшированного результата run_full_diagnostics().
++  * Предоставить один фоновый запуск run_full_diagnostics() (в рабочем
++    потоке, без блокировки UI), который по завершении испускает Qt‑сигнал,
++    чтобы все подписчики (селекторы моделей, статус‑бар, визард, панель
++    настроек) перечитали кэш и перерисовались.
++
++Это убирает ВСЕ синхронные `import torch`/`import TTS` с пути старта окна
++MainWindow.__init__, из‑за которых битый torch убивал GUI‑процесс ещё до
++window.show().
++"""
++from __future__ import annotations
++
++import threading
++from typing import Optional
++
++from PySide6.QtCore import QObject, Signal, Slot
++
++from ai_studio_core.env_core.diagnostics import (
++    load_diagnostics_cache,
++    run_full_diagnostics,
++)
++
++
++def _cache_says_ok(component: str) -> bool:
++    """True, если в кэше диагностики компонент == True (т.е. работает)."""
++    try:
++        cache = load_diagnostics_cache()
++    except Exception:
++        return False
++    return cache.get(component) is True
++
++
++def torch_available() -> bool:
++    """Доступен ли torch по последней диагностике? БЕЗ импорта torch."""
++    return _cache_says_ok("torch")
++
++
++def tts_available() -> bool:
++    """Доступен ли Coqui TTS по последней диагностике? БЕЗ импорта TTS/torch."""
++    return _cache_says_ok("tts") and _cache_says_ok("torch")
++
++
++def coqui_available() -> bool:
++    """Синоним для tts_available() — используется в TTSController."""
++    return tts_available()
++
++
++def diffusers_available() -> bool:
++    """Stable‑Diffusion бэкенд доступен? Требуется torch + diffusers.
++
++    diffusers не входит в число компонентов run_full_diagnostics, поэтому
++    факт установки модуля diffusers проверяется отдельным лёгким импортом
++    (diffusers не тянет нативные .so/.dll torch'а и не умеет уронить
++    процесс на старте). Если torch в кэше не помечен как рабочий —
++    сразу возвращаем False без импорта diffusers.
++    """
++    if not _cache_says_ok("torch"):
++        return False
++    try:
++        import diffusers  # noqa: F401
++        return True
++    except Exception:
++        return False
++
++
++def _probe_cuda_in_torch() -> tuple[bool, str]:
++    """Импортирует torch и смотрит torch.cuda.is_available().
++
++    Вызывается ИСКЛЮЧИТЕЛЬНО из фонового потока (DiagnosticsBridge) ПОСЛЕ
++    того как run_full_diagnostics подтвердила, что torch рабочий — т.е.
++    в момент, когда import torch не должен уронить процесс. Даже если упадёт,
++    это произойдёт в фоне и не повлияет на старт GUI.
++    """
++    try:
++        import torch  # noqa: F811
++        if torch.cuda.is_available():
++            try:
++                name = torch.cuda.get_device_name(0)
++            except Exception:
++                name = "CUDA"
++            return True, name
++        return False, ""
++    except Exception:
++        return False, ""
++
++
++class DiagnosticsBridge(QObject):
++    """Одиночный мост: один фоновый запуск диагностики, один сигнал."""
++
++    diagnostics_updated = Signal()   # без аргументов: подписчики читают cached_results()
++    cuda_info_changed = Signal(bool, str)  # (available, device_name)
++
++    def __init__(self, parent: QObject | None = None):
++        super().__init__(parent)
++        self._refresh_started = False
++        self._results: dict = {}
++        self._cuda_available: bool = False
++        self._cuda_device_name: str = ""
++
++    # ── Чтение кэша ──
++    def cached_results(self) -> dict:
++        if not self._results:
++            try:
++                self._results = load_diagnostics_cache()
++            except Exception:
++                self._results = {}
++        return dict(self._results)
++
++    def component_ok(self, name: str) -> bool:
++        return self.cached_results().get(name) is True
++
++    def cuda_available(self) -> bool:
++        return self._cuda_available
++
++    def cuda_device_name(self) -> str:
++        return self._cuda_device_name
++
++    # ── Фоновый запуск ──
++    def kickoff_refresh(self, force: bool = False) -> None:
++        """Запустить run_full_diagnostics в фоне (если ещё не запущен)."""
++        if self._refresh_started and not force:
++            return
++        self._refresh_started = True
++        bridge = self
++
++        def _worker():
++            try:
++                results = run_full_diagnostics(force_refresh=force)
++            except Exception as e:
++                results = {"_error": str(e)}
++            bridge._results = results or {}
++
++            # Пока мы в фоне и знаем, что torch рабочий — безопасно
++            # импортировать его для определения CUDA (не раньше).
++            if results.get("torch") is True:
++                cuda_ok, cuda_name = _probe_cuda_in_torch()
++            else:
++                cuda_ok, cuda_name = False, ""
++
++            from PySide6.QtCore import QMetaObject, Qt
++
++            def _apply():
++                bridge._cuda_available = cuda_ok
++                bridge._cuda_device_name = cuda_name
++                bridge.cuda_info_changed.emit(cuda_ok, cuda_name)
++                bridge.diagnostics_updated.emit()
++
++            try:
++                QMetaObject.invokeMethod(
++                    bridge, "_apply_in_gui", Qt.ConnectionType.QueuedConnection
++                )
++            except Exception:
++                # invokeMethod с методом без аргументов работает стабильно
++                # через QMetaObject в PySide6; если вызов не сработал —
++                # откатываемся к прямому вызову (в худшем случае подписчики
++                # получат сигнал из фонового потока, что безопасно для
++                # большинства Qt‑операций чтения).
++                _apply()
++
++        threading.Thread(target=_worker, daemon=True, name="diag-refresh").start()
++
++    @Slot()
++    def _apply_in_gui(self) -> None:
++        # Этот слот вызывается через QueuedConnection в GUI‑потоке после
++        # завершения фоновой диагностики.
++        # Повторно читаем кэш с диска (run_full_diagnostics уже сохранил его).
++        try:
++            self._results = load_diagnostics_cache()
++        except Exception:
++            pass
++
++
++# Глобальный singleton, создаваемый по требованию (чтобы не требовался
++# QApplication на момент импорта модуля).
++_BRIDGE: Optional[DiagnosticsBridge] = None
++
++
++def get_bridge() -> DiagnosticsBridge:
++    global _BRIDGE
++    if _BRIDGE is None:
++        _BRIDGE = DiagnosticsBridge()
++    return _BRIDGE

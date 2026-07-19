@@ -1,0 +1,27 @@
+ТЗ: убрать прямой import torch из GUI-процесса, использовать кэш диагностики
+Проблема
+GUI-процесс (ai_studio_core/ui/*) делает синхронный import torch внутри самого процесса на пути старта окна. Если импорт torch падает нативно (illegal instruction / битые CUDA-DLL и т.п.), процесс молча умирает без исключения и без логов, ещё до window.show(). В проекте уже есть безопасный механизм — env_core.diagnostics.run_full_diagnostics() — который проверяет torch/TTS/rvc_python в изолированном сабпроцессе с таймаутом и кэширует результат. GUI-слой этот механизм не использует.
+Затронутые файлы (прямой import torch в процессе GUI)
+ai_studio_core/ui/controllers/tts_controller.py     — _coqui_available() (строка ~28), строка ~328
+ai_studio_core/ui/controllers/image_controller.py   — строки ~20, ~68
+ai_studio_core/ui/panels/settings_panel.py          — строка ~24
+ai_studio_core/ui/dialogs/env_setup_wizard.py       — строка ~55
+ai_studio_core/ui/widgets/status_bar.py             — строка ~98
+Критично: tts_controller.py:_coqui_available() вызывается из available_models(), а он — синхронно из MainWindow.__init__ → _setup_workspaces() (main_window.py:290), то есть при каждом запуске окна.
+Что сделать
+
+Во всех перечисленных местах заменить прямой import torch (для проверки доступности) на чтение закэшированного результата env_core.diagnostics (load_safe_files_cache() / DIAG_CACHE_PATH). Никаких импортов torch в основном процессе GUI на пути старта окна быть не должно.
+Если кэша диагностики ещё нет:
+
+backend coqui считать недоступным (status: "download" / fallback на espeak) до завершения диагностики;
+запустить run_full_diagnostics() в фоне (она уже через сабпроцесс) и обновить статус через сигнал/колбэк, когда результат придёт — без блокировки UI-потока.
+
+
+tts_controller.py:328 (реальный вызов синтеза, не проверка доступности) — оставить как есть, но убедиться, что этот путь выполняется в WorkerThread, а не в GUI-потоке (если ещё не так — вынести).
+В env_core/diagnostics.py актуализировать CRITICAL_COMPONENTS/комментарии: torch, torchaudio, torchvision, tts не должны считаться критичными для «запуска GUI как такового» — это унаследованная формулировка от старой tkinter-архитектуры (XTTS Studio). В новой PySide6-версии GUI обязан стартовать без ML-стека, с fallback на espeak.
+
+Критерий приёмки
+
+grep -rn "import torch" ai_studio_core/ui/ даёт только вызовы внутри воркер-потоков/сабпроцессов, ни одного — на синхронном пути инициализации окна.
+Запуск GUI на машине без torch / с намеренно битым torch (например, pip install torch==<заведомо несовместимая сборка>) не крашит процесс — окно открывается, TTS работает через espeak, статус coqui отображается как недоступный.
+Существующие тесты (test/test_diagnostics.py, test_ai_conductor.py и headless-набор в CI) остаются зелёными.

@@ -14,15 +14,20 @@ from PySide6.QtWidgets import (
 
 from ai_studio_core.i18n import LANGUAGES, t as tr
 
+from ..diag_bridge import get_bridge
 from ..theme.tokens import TOKENS
 from ..widgets.collapsible_group import CollapsibleGroup
 
 
 def _cuda_available() -> bool:
-    """CUDA есть только если установлен torch и видит GPU. Без torch — честно скрываем."""
+    """CUDA есть только если диагностика подтвердила рабочий torch и видимый GPU.
+
+    Прямой import torch в GUI‑процессе на старте окна не делаем — битый
+    torch может убить процесс до window.show(). После завершения фоновой
+    диагностики bridge обновит статус и панель перестроит комбобокс.
+    """
     try:
-        import torch
-        return bool(torch.cuda.is_available())
+        return get_bridge().cuda_available()
     except Exception:
         return False
 
@@ -70,12 +75,9 @@ class SettingsPanel(QWidget):
         self._perf_group = CollapsibleGroup("")
         perf_form = QFormLayout()
         self._device = QComboBox()
-        self._device.addItem(tr("device_auto"), userData="auto")
-        self._device.addItem("CPU", userData="cpu")
-        if _cuda_available():
-            self._device.addItem("CUDA", userData="cuda")
         self._device_lbl = QLabel()
         perf_form.addRow(self._device_lbl, self._device)
+        self._rebuild_device_combo()
 
         self._threads = QSpinBox()
         self._threads.setRange(1, 32)
@@ -159,6 +161,26 @@ class SettingsPanel(QWidget):
         self._auto_save.toggled.connect(lambda _v: self._emit_settings())
 
         self.retranslate_ui()
+
+    def _rebuild_device_combo(self) -> None:
+        """Перестроить комбобокс устройства после получения диагностики CUDA."""
+        current = self._device.currentData() if self._device.count() else "auto"
+        self._device.blockSignals(True)
+        self._device.clear()
+        self._device.addItem(tr("device_auto"), userData="auto")
+        self._device.addItem("CPU", userData="cpu")
+        if _cuda_available():
+            name = get_bridge().cuda_device_name() or "CUDA"
+            self._device.addItem(f"CUDA — {name}", userData="cuda")
+        # Вернуть предыдущий выбор (если его нет — auto)
+        idx = self._device.findData(current)
+        if idx >= 0:
+            self._device.setCurrentIndex(idx)
+        self._device.blockSignals(False)
+
+    def refresh_device_options(self) -> None:
+        """Публичный слот для подписки на diagnostics_updated / cuda_info_changed."""
+        self._rebuild_device_combo()
 
     # ── Public API ──
 
