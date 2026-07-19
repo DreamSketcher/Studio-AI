@@ -20,6 +20,8 @@ Layout:
 """
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QByteArray, QSettings, Qt, Slot
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
@@ -38,6 +40,29 @@ from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
 from .panels import (
     HistoryPanel, InspectorPanel, ModelHubPanel, QueuePanel, SettingsPanel,
 )
+
+
+class _NoopExperience:
+    """Отладочный выключатель experience-слоя (AI_STUDIO_NO_XP=1):
+    без звуков (QSoundEffect), пульсов и пресетов. Только для изоляции
+    нативных падений на старте."""
+
+    def handle(self, *args, **kwargs):
+        return False
+
+    def configure(self, *args, **kwargs):
+        pass
+
+    def set_sounds_enabled(self, *args, **kwargs):
+        pass
+
+
+class _NoopUsage:
+    """Отладочная замена UsageStats: любой метод — тихий no-op,
+    ничего не пишет на диск."""
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
 from .widgets.log_console import LogConsole
 from .widgets.status_bar import ResourceStatusBar
 from .widgets.toast import Toast
@@ -89,12 +114,14 @@ class MainWindow(QMainWindow):
         # Подписываемся на окончание фоновой диагностики — тогда селекторы
         # моделей и комбобокс устройства обновятся, а статус‑бар начнёт
         # показывать GPU/VRAM. Прямого import torch в __init__ нет.
-        bridge = get_bridge()
-        bridge.diagnostics_updated.connect(self._on_diagnostics_updated)
-        # Запускаем фоновую диагностику ПОСЛЕ показа окна (singleShot 0),
-        # чтобы окно успело отрисоваться до того как subprocess стартанёт.
+        # AI_STUDIO_NO_DIAG=1 — отладочный выключатель фонового потока.
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
+        if os.environ.get("AI_STUDIO_NO_DIAG") != "1":
+            bridge = get_bridge()
+            bridge.diagnostics_updated.connect(self._on_diagnostics_updated)
+            # Запускаем фоновую диагностику ПОСЛЕ показа окна (singleShot 0),
+            # чтобы окно успело отрисоваться до того как subprocess стартанёт.
+            QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
         QTimer.singleShot(300, lambda: (
             self._toast(tr("msg_welcome"), "info"),
             self._xp.handle(self._xp_events.APP_STARTED),
@@ -225,6 +252,8 @@ class MainWindow(QMainWindow):
     # ── Status bar ──
     def _setup_status_bar(self) -> None:
         self._resource_bar = ResourceStatusBar()
+        if os.environ.get("AI_STUDIO_NO_PS") == "1":
+            self._resource_bar.stop_polling()
         self.setStatusBar(self._resource_bar)
         self._resource_bar.set_message(tr("msg_ready"))
 
@@ -240,15 +269,26 @@ class MainWindow(QMainWindow):
 
     def _setup_experience(self) -> None:
         from .experience import events as xp_events
+
+        self._xp_events = xp_events
+        self._xp_stats_mod = None
+        self._pulse_bar = None
+        self._had_running = False
+        self._suppress_activation_rec = False
+        self._session_t0 = None
+
+        if os.environ.get("AI_STUDIO_NO_XP") == "1":
+            # Отладочный выключатель: ни manager, ни QSoundEffect, ни
+            # записи usage_stats.json — полная изоляция слоя.
+            self._xp = _NoopExperience()
+            self._usage = _NoopUsage()
+            return
+
         from .experience import presets as xp_presets
         from .experience import stats as xp_stats
         from .experience.manager import ExperienceManager
 
-        self._xp_events = xp_events
         self._xp_stats_mod = xp_stats
-        self._pulse_bar = None
-        self._had_running = False
-        self._suppress_activation_rec = False
 
         self._xp = ExperienceManager(
             toast_cb=lambda text, variant: self._toast(text, variant),

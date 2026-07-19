@@ -64,6 +64,14 @@ class ResourceStatusBar(QStatusBar):
         except Exception:
             pass
 
+    def stop_polling(self) -> None:
+        """Остановить периодический опрос psutil/GPU (AI_STUDIO_NO_PS=1,
+        отладочный выключатель для изоляции нативных падений на старте)."""
+        try:
+            self._poll_timer.stop()
+        except Exception:
+            pass
+
     def set_message(self, text: str) -> None:
         self._message_label.setText(text)
 
