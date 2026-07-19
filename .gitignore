@@ -7,3 +7,5 @@ cache/
 json/usage_stats.json
 json/history.json
 .sudo_as_admin_successful
+logs/*.log
+.pytest_cache/
