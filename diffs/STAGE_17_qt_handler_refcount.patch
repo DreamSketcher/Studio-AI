@@ -1,0 +1,116 @@
+From 03417923d08f6579c6e06931b34f1a90f3dece3c Mon Sep 17 00:00:00 2001
+From: arena-agent <agent@local>
+Date: Sun, 19 Jul 2026 11:31:04 +0000
+Subject: [PATCH] =?UTF-8?q?Stage=2017=20=E2=80=94=20CRITICAL=20FIX:=20keep?=
+ =?UTF-8?q?=20global=20ref=20to=20Qt=20message=20handler=20(GC-collected?=
+ =?UTF-8?q?=20closure=20=3D=20dangling=20pointer=20=3D=20access=20violatio?=
+ =?UTF-8?q?n=20on=20first=20Qt=20warning);=20+2=20regression=20tests?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ ai_studio_core/ui/app.py    |  7 +++++
+ test/test_qt_msg_handler.py | 58 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+)
+ create mode 100644 test/test_qt_msg_handler.py
+
+diff --git a/ai_studio_core/ui/app.py b/ai_studio_core/ui/app.py
+index ce27e4f..64238cb 100644
+--- a/ai_studio_core/ui/app.py
++++ b/ai_studio_core/ui/app.py
+@@ -16,6 +16,11 @@ from .theme.palette import make_dark_palette
+ 
+ _LANGUAGE_KEY = "ui/language"
+ 
++# Ссылка на Qt message handler ДОЛЖНА жить вечно: qInstallMessageHandler
++# хранит только голый указатель, и если callable соберёт GC, первое же
++# сообщение Qt позовёт освобождённый объект -> access violation.
++_QT_MSG_HANDLER = None
++
+ 
+ def _install_qt_log_handler() -> None:
+     """Все предупреждения Qt -> logs/xtts_studio.log.
+@@ -24,6 +29,7 @@ def _install_qt_log_handler() -> None:
+     и т.п.) Qt почти всегда печатает warning в консоль — в GUI из консоли
+     его не прочитать, поэтому перенаправляем в файл лога.
+     """
++    global _QT_MSG_HANDLER
+     from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+ 
+     levels = {
+@@ -40,6 +46,7 @@ def _install_qt_log_handler() -> None:
+         except Exception:
+             pass
+ 
++    _QT_MSG_HANDLER = _handler
+     qInstallMessageHandler(_handler)
+ 
+ 
+diff --git a/test/test_qt_msg_handler.py b/test/test_qt_msg_handler.py
+new file mode 100644
+index 0000000..f533d76
+--- /dev/null
++++ b/test/test_qt_msg_handler.py
+@@ -0,0 +1,58 @@
++# -*- coding: utf-8 -*-
++"""Регрессия STAGE_17: Qt message handler не должен собираться GC.
++
++PySide6: qInstallMessageHandler хранит голый указатель — если Python-callable
++умрёт, Qt позовёт освобождённый объект -> access violation (Windows) /
++segfault. Поэтому ui.app держит глобальную ссылку _QT_MSG_HANDLER.
++"""
++from __future__ import annotations
++
++import gc
++import os
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="Qt message handler — Qt")
++
++from PySide6.QtCore import qInstallMessageHandler, qWarning  # noqa: E402
++from PySide6.QtWidgets import QApplication  # noqa: E402
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _restore_handler():
++    qInstallMessageHandler(None)
++
++
++def test_handler_survives_gc_and_logs_qt_warning(app, monkeypatch):
++    from ai_studio_core.ui import app as app_mod
++    from ai_studio_core import logging_utils
++
++    captured = []
++    monkeypatch.setattr(logging_utils, "write_log", lambda t: captured.append(t))
++    monkeypatch.setattr(app_mod, "write_log", lambda t: captured.append(t))
++
++    try:
++        app_mod._install_qt_log_handler()
++        # Условие краша из STAGE_16: локальное замыкание умерло после return
++        gc.collect()
++        qWarning("test-handler-regression-probe")
++        assert any("QT-WARN" in line and "test-handler-regression-probe" in line
++                   for line in captured), captured
++        assert app_mod._QT_MSG_HANDLER is not None
++    finally:
++        _restore_handler()
++
++
++def test_handler_reference_is_global(app):
++    import inspect
++    from ai_studio_core.ui import app as app_mod
++
++    src = inspect.getsource(app_mod._install_qt_log_handler)
++    assert "_QT_MSG_HANDLER" in src, "handler должен сохраняться в глобал"
+-- 
+2.47.3
+
