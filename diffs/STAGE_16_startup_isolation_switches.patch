@@ -1,0 +1,432 @@
+From c758c5d362904230e5709d984c985c39cc538fad Mon Sep 17 00:00:00 2001
+From: arena-agent <agent@local>
+Date: Sun, 19 Jul 2026 10:28:32 +0000
+Subject: [PATCH] =?UTF-8?q?Stage=2016=20=E2=80=94=20startup=20crash=20inve?=
+ =?UTF-8?q?stigation=20kit:=20faulthandler->logs/crash=5Fdump.txt,=20Qt=20?=
+ =?UTF-8?q?warnings->xtts=5Fstudio.log,=20boot=20markers,=20env=20kill-swi?=
+ =?UTF-8?q?tches=20(NO=5FQSS/NO=5FDIAG/NO=5FXP/NO=5FPS),=20+5=20tests?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ ai_studio_core/ui/app.py                |  47 +++++++-
+ ai_studio_core/ui/main_window.py        |  58 ++++++++--
+ ai_studio_core/ui/widgets/status_bar.py |   8 ++
+ run_gui.py                              |  39 +++++++
+ test/test_startup_switches.py           | 136 ++++++++++++++++++++++++
+ 5 files changed, 274 insertions(+), 14 deletions(-)
+ create mode 100644 test/test_startup_switches.py
+
+diff --git a/ai_studio_core/ui/app.py b/ai_studio_core/ui/app.py
+index 214c9f6..ce27e4f 100644
+--- a/ai_studio_core/ui/app.py
++++ b/ai_studio_core/ui/app.py
+@@ -1,6 +1,7 @@
+ """Точка входа приложения."""
+ from __future__ import annotations
+ 
++import os
+ import sys
+ from pathlib import Path
+ 
+@@ -8,6 +9,7 @@ from PySide6.QtCore import QFile, QSettings, QTextStream, Qt
+ from PySide6.QtWidgets import QApplication
+ 
+ from ai_studio_core import i18n
++from ai_studio_core.logging_utils import write_log
+ 
+ from .main_window import MainWindow
+ from .theme.palette import make_dark_palette
+@@ -15,6 +17,32 @@ from .theme.palette import make_dark_palette
+ _LANGUAGE_KEY = "ui/language"
+ 
+ 
++def _install_qt_log_handler() -> None:
++    """Все предупреждения Qt -> logs/xtts_studio.log.
++
++    Перед нативным падением (шрифты DirectWrite, плагины платформы, WASAPI
++    и т.п.) Qt почти всегда печатает warning в консоль — в GUI из консоли
++    его не прочитать, поэтому перенаправляем в файл лога.
++    """
++    from PySide6.QtCore import QtMsgType, qInstallMessageHandler
++
++    levels = {
++        QtMsgType.QtInfoMsg: "QT-INFO",
++        QtMsgType.QtDebugMsg: "QT-DEBUG",
++        QtMsgType.QtWarningMsg: "QT-WARN",
++        QtMsgType.QtCriticalMsg: "QT-CRIT",
++        QtMsgType.QtFatalMsg: "QT-FATAL",
++    }
++
++    def _handler(mode, _ctx, msg):
++        try:
++            write_log(f"[{levels.get(mode, 'QT')}] {msg}")
++        except Exception:
++            pass
++
++    qInstallMessageHandler(_handler)
++
++
+ def run() -> int:
+     QApplication.setHighDpiScaleFactorRoundingPolicy(
+         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+@@ -24,20 +52,29 @@ def run() -> int:
+     app.setApplicationName("AI Studio")
+     app.setOrganizationName("ai_studio")
+     app.setApplicationVersion("0.1.0")
++    _install_qt_log_handler()
++    write_log("[GUI] QApplication создан")
+ 
+     # Язык интерфейса восстанавливаем до построения виджетов
+     saved_lang = QSettings("ai_studio", "studio").value(_LANGUAGE_KEY, None)
+     if saved_lang:
+         i18n.set_language(str(saved_lang))
+ 
+-    # Тема
+-    app.setPalette(make_dark_palette())
+-    _load_stylesheet(app)
++    # Тема (AI_STUDIO_NO_QSS=1 — отладочный выключатель: без палитры и QSS)
++    if os.environ.get("AI_STUDIO_NO_QSS") == "1":
++        write_log("[GUI] тема отключена (AI_STUDIO_NO_QSS=1)")
++    else:
++        app.setPalette(make_dark_palette())
++        _load_stylesheet(app)
++        write_log("[GUI] палитра и stylesheet применены")
+ 
+     window = MainWindow()
++    write_log("[GUI] MainWindow построено")
+     window.show()
+-
+-    return app.exec()
++    write_log("[GUI] window.show() — вход в exec")
++    rc = app.exec()
++    write_log(f"[GUI] exec завершён с кодом {rc}")
++    return rc
+ 
+ 
+ def _load_stylesheet(app: QApplication) -> None:
+diff --git a/ai_studio_core/ui/main_window.py b/ai_studio_core/ui/main_window.py
+index bf35615..62e4209 100644
+--- a/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ui/main_window.py
+@@ -20,6 +20,8 @@ Layout:
+ """
+ from __future__ import annotations
+ 
++import os
++
+ from PySide6.QtCore import QByteArray, QSettings, Qt, Slot
+ from PySide6.QtGui import QAction, QKeySequence
+ from PySide6.QtWidgets import (
+@@ -38,6 +40,29 @@ from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
+ from .panels import (
+     HistoryPanel, InspectorPanel, ModelHubPanel, QueuePanel, SettingsPanel,
+ )
++
++
++class _NoopExperience:
++    """Отладочный выключатель experience-слоя (AI_STUDIO_NO_XP=1):
++    без звуков (QSoundEffect), пульсов и пресетов. Только для изоляции
++    нативных падений на старте."""
++
++    def handle(self, *args, **kwargs):
++        return False
++
++    def configure(self, *args, **kwargs):
++        pass
++
++    def set_sounds_enabled(self, *args, **kwargs):
++        pass
++
++
++class _NoopUsage:
++    """Отладочная замена UsageStats: любой метод — тихий no-op,
++    ничего не пишет на диск."""
++
++    def __getattr__(self, _name):
++        return lambda *args, **kwargs: None
+ from .widgets.log_console import LogConsole
+ from .widgets.status_bar import ResourceStatusBar
+ from .widgets.toast import Toast
+@@ -89,12 +114,14 @@ class MainWindow(QMainWindow):
+         # Подписываемся на окончание фоновой диагностики — тогда селекторы
+         # моделей и комбобокс устройства обновятся, а статус‑бар начнёт
+         # показывать GPU/VRAM. Прямого import torch в __init__ нет.
+-        bridge = get_bridge()
+-        bridge.diagnostics_updated.connect(self._on_diagnostics_updated)
+-        # Запускаем фоновую диагностику ПОСЛЕ показа окна (singleShot 0),
+-        # чтобы окно успело отрисоваться до того как subprocess стартанёт.
++        # AI_STUDIO_NO_DIAG=1 — отладочный выключатель фонового потока.
+         from PySide6.QtCore import QTimer
+-        QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
++        if os.environ.get("AI_STUDIO_NO_DIAG") != "1":
++            bridge = get_bridge()
++            bridge.diagnostics_updated.connect(self._on_diagnostics_updated)
++            # Запускаем фоновую диагностику ПОСЛЕ показа окна (singleShot 0),
++            # чтобы окно успело отрисоваться до того как subprocess стартанёт.
++            QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
+         QTimer.singleShot(300, lambda: (
+             self._toast(tr("msg_welcome"), "info"),
+             self._xp.handle(self._xp_events.APP_STARTED),
+@@ -225,6 +252,8 @@ class MainWindow(QMainWindow):
+     # ── Status bar ──
+     def _setup_status_bar(self) -> None:
+         self._resource_bar = ResourceStatusBar()
++        if os.environ.get("AI_STUDIO_NO_PS") == "1":
++            self._resource_bar.stop_polling()
+         self.setStatusBar(self._resource_bar)
+         self._resource_bar.set_message(tr("msg_ready"))
+ 
+@@ -240,15 +269,26 @@ class MainWindow(QMainWindow):
+ 
+     def _setup_experience(self) -> None:
+         from .experience import events as xp_events
+-        from .experience import presets as xp_presets
+-        from .experience import stats as xp_stats
+-        from .experience.manager import ExperienceManager
+ 
+         self._xp_events = xp_events
+-        self._xp_stats_mod = xp_stats
++        self._xp_stats_mod = None
+         self._pulse_bar = None
+         self._had_running = False
+         self._suppress_activation_rec = False
++        self._session_t0 = None
++
++        if os.environ.get("AI_STUDIO_NO_XP") == "1":
++            # Отладочный выключатель: ни manager, ни QSoundEffect, ни
++            # записи usage_stats.json — полная изоляция слоя.
++            self._xp = _NoopExperience()
++            self._usage = _NoopUsage()
++            return
++
++        from .experience import presets as xp_presets
++        from .experience import stats as xp_stats
++        from .experience.manager import ExperienceManager
++
++        self._xp_stats_mod = xp_stats
+ 
+         self._xp = ExperienceManager(
+             toast_cb=lambda text, variant: self._toast(text, variant),
+diff --git a/ai_studio_core/ui/widgets/status_bar.py b/ai_studio_core/ui/widgets/status_bar.py
+index 0ff5132..f7e3296 100644
+--- a/ai_studio_core/ui/widgets/status_bar.py
++++ b/ai_studio_core/ui/widgets/status_bar.py
+@@ -64,6 +64,14 @@ class ResourceStatusBar(QStatusBar):
+         except Exception:
+             pass
+ 
++    def stop_polling(self) -> None:
++        """Остановить периодический опрос psutil/GPU (AI_STUDIO_NO_PS=1,
++        отладочный выключатель для изоляции нативных падений на старте)."""
++        try:
++            self._poll_timer.stop()
++        except Exception:
++            pass
++
+     def set_message(self, text: str) -> None:
+         self._message_label.setText(text)
+ 
+diff --git a/run_gui.py b/run_gui.py
+index 7d5990e..e7adbde 100644
+--- a/run_gui.py
++++ b/run_gui.py
+@@ -3,13 +3,52 @@
+ 
+ Использование:
+     python run_gui.py
++
++Отладочные выключатели (переменные окружения, для изоляции падений):
++    AI_STUDIO_NO_QSS=1  — без stylesheet и тёмной палитры;
++    AI_STUDIO_NO_DIAG=1 — без фоновой диагностики env_core;
++    AI_STUDIO_NO_XP=1   — без experience-слоя (звуки/пульсы/статистика);
++    AI_STUDIO_NO_PS=1   — без периодического опроса psutil в статус-баре.
++
++Fatal-дампы нативных падений пишутся в logs/crash_dump.txt (и на stderr —
++на stderr они появляются только если файл открыть не удалось).
+ """
+ from __future__ import annotations
+ 
+ import sys
+ 
++_CRASH_LOG = None  # держим ссылку, чтобы файл не закрылся GC
++
++
++def _enable_crash_log() -> None:
++    """faulthandler -> logs/crash_dump.txt.
++
++    Windows fatal exception происходит в нативном коде (Qt/драйверы) — обычный
++    traceback его не поймает. faulthandler на fatal-событии печатает стеки
++    всех Python-потоков; сохраняем их в файл для расследования.
++    """
++    global _CRASH_LOG
++    try:
++        import faulthandler
++        from datetime import datetime
++        from pathlib import Path
++
++        log_dir = Path(__file__).parent / "logs"
++        log_dir.mkdir(exist_ok=True)
++        _CRASH_LOG = open(log_dir / "crash_dump.txt", "a", encoding="utf-8")
++        _CRASH_LOG.write(f"\n===== запуск {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
++        _CRASH_LOG.flush()
++        faulthandler.enable(_CRASH_LOG)
++    except Exception:
++        import faulthandler
++        try:
++            faulthandler.enable()  # fallback: stderr
++        except Exception:
++            pass
++
+ 
+ if __name__ == "__main__":
++    _enable_crash_log()
+     try:
+         from ai_studio_core.ui import run
+     except ImportError as e:
+diff --git a/test/test_startup_switches.py b/test/test_startup_switches.py
+new file mode 100644
+index 0000000..3b4f756
+--- /dev/null
++++ b/test/test_startup_switches.py
+@@ -0,0 +1,136 @@
++# -*- coding: utf-8 -*-
++"""Отладочные выключатели старта (изоляция нативного access violation):
++
++AI_STUDIO_NO_XP=1   — без experience-слоя (QSoundEffect/пульсы/usage_stats);
++AI_STUDIO_NO_DIAG=1 — без фонового потока диагностики;
++AI_STUDIO_NO_PS=1   — без периодического опроса psutil;
++AI_STUDIO_NO_QSS=1  — без палитры/stylesheet (проверяется в ui.app).
++"""
++from __future__ import annotations
++
++import os
++import time
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="MainWindow — Qt")
++
++from PySide6.QtCore import QSettings  # noqa: E402
++from PySide6.QtWidgets import QApplication  # noqa: E402
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++@pytest.fixture()
++def clean_env(tmp_path, monkeypatch):
++    """Изоляция QSettings/статистики/диаг-моста + чистый singleton."""
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
++    QSettings("ai_studio", "studio").clear()
++    from ai_studio_core.ui import diag_bridge as bridge_mod
++    bridge_mod._BRIDGE = None
++    from ai_studio_core.ui.experience import stats as xp_stats
++    monkeypatch.setattr(xp_stats, "STATS_PATH", str(tmp_path / "usage_stats.json"))
++    yield
++    bridge_mod._BRIDGE = None
++
++
++def _wait_ms(app, ms):
++    t0 = time.time()
++    while (time.time() - t0) * 1000 < ms:
++        app.processEvents()
++        time.sleep(0.01)
++
++
++class TestNoXpSwitch:
++    def test_no_xp_uses_noop_layer(self, app, clean_env, monkeypatch, tmp_path):
++        monkeypatch.setenv("AI_STUDIO_NO_XP", "1")
++        monkeypatch.delenv("AI_STUDIO_NO_DIAG", raising=False)
++        from ai_studio_core.ui.diag_bridge import load_diagnostics_cache  # noqa: F401
++        from ai_studio_core.ui import diag_bridge as bridge_mod
++        monkeypatch.setattr(bridge_mod, "run_full_diagnostics",
++                            lambda force_refresh=False: {})
++        monkeypatch.setattr(bridge_mod, "load_diagnostics_cache", dict)
++
++        from ai_studio_core.ui.main_window import MainWindow, _NoopExperience
++        w = MainWindow()
++        w.show()
++        _wait_ms(app, 500)
++
++        assert isinstance(w._xp, _NoopExperience)
++        assert w._xp.handle("anything") is False
++        w._usage.record_session(); w._usage.save(); w._usage.record_action("x")
++        # usage_stats.json не создаётся — слой полностью обойдён
++        assert not (tmp_path / "usage_stats.json").exists()
++        w.close()
++
++    def test_default_xp_active(self, app, clean_env, monkeypatch):
++        monkeypatch.delenv("AI_STUDIO_NO_XP", raising=False)
++        from ai_studio_core.ui import diag_bridge as bridge_mod
++        monkeypatch.setattr(bridge_mod, "run_full_diagnostics",
++                            lambda force_refresh=False: {})
++        monkeypatch.setattr(bridge_mod, "load_diagnostics_cache", dict)
++
++        from ai_studio_core.ui.main_window import MainWindow, _NoopExperience
++        w = MainWindow()
++        w.show()
++        _wait_ms(app, 500)
++        assert not isinstance(w._xp, _NoopExperience)
++        w.close()
++
++
++class TestNoDiagSwitch:
++    def test_no_diag_never_starts_worker(self, app, clean_env, monkeypatch):
++        monkeypatch.setenv("AI_STUDIO_NO_DIAG", "1")
++        from ai_studio_core.ui import diag_bridge as bridge_mod
++
++        called = {"n": 0}
++        def spy(force_refresh=False):
++            called["n"] += 1
++            return {}
++        monkeypatch.setattr(bridge_mod, "run_full_diagnostics", spy)
++        monkeypatch.setattr(bridge_mod, "load_diagnostics_cache", dict)
++
++        from ai_studio_core.ui.main_window import MainWindow
++        w = MainWindow()
++        w.show()
++        _wait_ms(app, 600)
++
++        assert called["n"] == 0, "диагностика стартовала при AI_STUDIO_NO_DIAG=1"
++        assert bridge_mod.get_bridge()._refresh_started is False
++        w.close()
++
++
++class TestNoPsSwitch:
++    def test_no_ps_stops_polling(self, app, clean_env, monkeypatch):
++        monkeypatch.setenv("AI_STUDIO_NO_PS", "1")
++        from ai_studio_core.ui import diag_bridge as bridge_mod
++        monkeypatch.setattr(bridge_mod, "run_full_diagnostics",
++                            lambda force_refresh=False: {})
++        monkeypatch.setattr(bridge_mod, "load_diagnostics_cache", dict)
++
++        from ai_studio_core.ui.main_window import MainWindow
++        w = MainWindow()
++        w.show()
++        _wait_ms(app, 200)
++        assert not w._resource_bar._poll_timer.isActive()
++        w.close()
++
++    def test_default_polling_active(self, app, clean_env, monkeypatch):
++        monkeypatch.delenv("AI_STUDIO_NO_PS", raising=False)
++        from ai_studio_core.ui import diag_bridge as bridge_mod
++        monkeypatch.setattr(bridge_mod, "run_full_diagnostics",
++                            lambda force_refresh=False: {})
++        monkeypatch.setattr(bridge_mod, "load_diagnostics_cache", dict)
++
++        from ai_studio_core.ui.main_window import MainWindow
++        w = MainWindow()
++        w.show()
++        _wait_ms(app, 200)
++        assert w._resource_bar._poll_timer.isActive()
++        w.close()
+-- 
+2.47.3
+
