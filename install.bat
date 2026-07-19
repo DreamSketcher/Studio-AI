@@ -13,8 +13,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist requirements.txt (
-    echo [ERROR] Файл requirements.txt не найден.
+if not exist requirements-core.txt (
+    echo [ERROR] Файл requirements-core.txt не найден.
     pause
     exit /b 1
 )
@@ -24,7 +24,7 @@ python -m pip install --upgrade pip
 
 echo.
 echo Установка зависимостей...
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-core.txt
 
 if errorlevel 1 (
     echo.
