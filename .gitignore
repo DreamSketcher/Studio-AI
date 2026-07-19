@@ -1,1 +1,9 @@
 .import_linter_cache
+.env_diagnostics_cache.json
+__pycache__/
+*.py[cod]
+outputs/
+cache/
+json/usage_stats.json
+json/history.json
+.sudo_as_admin_successful
