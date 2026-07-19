@@ -1,0 +1,14 @@
+
+===== запуск 2026-07-19 13:42:43 =====
+Windows fatal exception: access violation
+
+Thread 0x00001f4c [diag-refresh] (most recent call first):
+  File "<frozen os>", line ??? in __iter__
+  <invalid frame>
+
+Current thread 0x000008f8 (most recent call first):
+  File "C:\Users\User\Desktop\Ai Studio\ai_studio_core\ui\app.py", line 75 in run
+  File "C:\Users\User\Desktop\Ai Studio\run_gui.py", line 61 in <module>
+
+Current thread's C stack trace (most recent call first):
+  <cannot get C stack on this system>
