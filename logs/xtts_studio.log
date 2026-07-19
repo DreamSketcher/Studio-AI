@@ -1,0 +1,4 @@
+[2026-07-18 22:17:47] [Diagnostics] Кэш диагностики успешно очищен.
+[2026-07-18 22:17:47] line1
+[2026-07-18 22:17:47] line2
+[2026-07-18 22:17:47] [Diagnostics] Удалён теневой бэкпорт dataclasses из site-packages: ['dataclasses-0.8.dist-info', 'dataclasses.py']
