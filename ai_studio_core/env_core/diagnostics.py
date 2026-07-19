@@ -66,7 +66,11 @@ def load_diagnostics_cache() -> dict:
         with open(DIAG_CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("results"), dict):
-            return data["results"]
+            res = dict(data["results"])
+            cuda = data.get("cuda") or {}
+            res["cuda_available"] = bool(cuda.get("available"))
+            res["cuda_name"] = str(cuda.get("name") or "")
+            return res
     except Exception as e:
         write_log(f"[Diagnostics] Не удалось прочитать кэш диагностики: {e}")
     return {}
@@ -545,7 +549,11 @@ def run_full_diagnostics(force_refresh=False) -> dict:
                     and cache.get("site_packages_count") == current_count
                     and "results" in cache
                 ):
-                    return cache["results"]
+                    res = dict(cache["results"])
+                    cuda = cache.get("cuda") or {}
+                    res["cuda_available"] = bool(cuda.get("available"))
+                    res["cuda_name"] = str(cuda.get("name") or "")
+                    return res
         except Exception as e:
             write_log(f"[Diagnostics] Ошибка проверки кэша диагностики: {e}")
 
@@ -658,6 +666,22 @@ try:
 except Exception as e:
     results['rvc_python'] = str(e)
 
+# CUDA-инфо опрашиваем ТОЛЬКО в этом изолированном сабпроцессе.
+# В GUI-процессе torch не импортируется никогда: access violation на битом
+# torch убивает процесс целиком, из какого бы потока ни был импорт.
+cuda_info = {"available": False, "name": ""}
+if results.get('torch') is True:
+    try:
+        cuda_info["available"] = bool(torch.cuda.is_available())
+        if cuda_info["available"]:
+            try:
+                cuda_info["name"] = str(torch.cuda.get_device_name(0))
+            except Exception:
+                cuda_info["name"] = "CUDA"
+    except Exception:
+        pass
+
+print("CUDA_RESULT=" + json.dumps(cuda_info))
 print("SUB_RESULT=" + json.dumps(results))
 """
         % clean_site_packages
@@ -678,6 +702,7 @@ print("SUB_RESULT=" + json.dumps(results))
         "rvc_python",
     )
     results = {}
+    cuda_info = {"available": False, "name": ""}
     try:
         env = os.environ.copy()
         # Таймаут увеличен относительно прежнего (30с хватало только на
@@ -688,11 +713,23 @@ print("SUB_RESULT=" + json.dumps(results))
         )
         out = proc.stdout or ""
         found = False
+        _cuda_raw = None
         for line in out.splitlines():
             if line.startswith("SUB_RESULT="):
                 results = json.loads(line.split("=", 1)[1])
                 found = True
-                break
+            elif line.startswith("CUDA_RESULT="):
+                try:
+                    _cuda_raw = json.loads(line.split("=", 1)[1])
+                except Exception:
+                    pass
+        if isinstance(_cuda_raw, dict):
+            # CUDA признаём доступной только если сам torch жив — флаг из
+            # прошлой жизни сабпроцесса не должен солгать при битом torch.
+            cuda_info["available"] = (
+                bool(_cuda_raw.get("available")) and results.get("torch") is True
+            )
+            cuda_info["name"] = str(_cuda_raw.get("name") or "")
 
         if not found:
             err_text = f"Subprocess failed: {proc.stderr or out}"
@@ -719,6 +756,7 @@ print("SUB_RESULT=" + json.dumps(results))
                 "timestamp": time.time(),
                 "results": results,
             }
+            cache_data["cuda"] = cuda_info
             with open(DIAG_CACHE_PATH, "w", encoding="utf-8") as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
             write_log("[Diagnostics] Результаты диагностики успешно закэшированы.")
@@ -727,6 +765,11 @@ print("SUB_RESULT=" + json.dumps(results))
     else:
         clear_diagnostics_cache()
 
+    # CUDA-ключи прилагаем ПОСЛЕ проверки is_all_ok и только в памяти —
+    # они не участвуют в критерии "всё ли работает" и не пишутся в
+    # cache["results"] (для них отдельный блок cache["cuda"]).
+    results["cuda_available"] = bool(cuda_info.get("available"))
+    results["cuda_name"] = str(cuda_info.get("name") or "")
     return results
 
 

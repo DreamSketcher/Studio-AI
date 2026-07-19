@@ -10,16 +10,20 @@
     чтобы все подписчики (селекторы моделей, статус‑бар, визард, панель
     настроек) перечитали кэш и перерисовались.
 
-Это убирает ВСЕ синхронные `import torch`/`import TTS` с пути старта окна
-MainWindow.__init__, из‑за которых битый torch убивал GUI‑процесс ещё до
-window.show().
+КРИТИЧЕСКОЕ ПРАВИЛО: в ЭТОМ процессе (GUI) torch/TTS/CUDA не импортируются
+НИКОГДА — ни на старте окна, ни в фоновом потоке. Access violation при
+импорте битого torch убивает процесс целиком из любого потока, поэтому
+«перенести импорт в поток» нельзя — можно только перенести его в другой
+процесс. Все импорты (включая опрос CUDA) делает изолированный сабпроцесс
+внутри env_core.diagnostics.run_full_diagnostics(); GUI читает только
+JSON-результаты (поля cuda_available/cuda_name).
 """
 from __future__ import annotations
 
 import threading
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, Qt, Signal, Slot
 
 from ai_studio_core.env_core.diagnostics import (
     load_diagnostics_cache,
@@ -69,36 +73,23 @@ def diffusers_available() -> bool:
         return False
 
 
-def _probe_cuda_in_torch() -> tuple[bool, str]:
-    """Импортирует torch и смотрит torch.cuda.is_available().
-
-    Вызывается ИСКЛЮЧИТЕЛЬНО из фонового потока (DiagnosticsBridge) ПОСЛЕ
-    того как run_full_diagnostics подтвердила, что torch рабочий — т.е.
-    в момент, когда import torch не должен уронить процесс. Даже если упадёт,
-    это произойдёт в фоне и не повлияет на старт GUI.
-    """
-    try:
-        import torch  # noqa: F811
-        if torch.cuda.is_available():
-            try:
-                name = torch.cuda.get_device_name(0)
-            except Exception:
-                name = "CUDA"
-            return True, name
-        return False, ""
-    except Exception:
-        return False, ""
-
-
 class DiagnosticsBridge(QObject):
-    """Одиночный мост: один фоновый запуск диагностики, один сигнал."""
+    """Одиночный мост: один фоновый запуск диагностики, два сигнала.
 
-    diagnostics_updated = Signal()   # без аргументов: подписчики читают cached_results()
+    Сигналы (diagnostics_updated / cuda_info_changed) испускаются строго
+    из GUI‑потока через QueuedConnection-слот _apply_in_gui — подписчики
+    могут безопасно трогать виджеты. Сам QObject создаётся в GUI‑потоке
+    (get_bridge() вызывается из конструкторов виджетов), поэтому queued
+    доставка гарантирована его очередью событий.
+    """
+
+    diagnostics_updated = Signal()        # подписчики читают cached_results()
     cuda_info_changed = Signal(bool, str)  # (available, device_name)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._refresh_started = False
+        self._running = False
         self._results: dict = {}
         self._cuda_available: bool = False
         self._cuda_device_name: str = ""
@@ -123,10 +114,18 @@ class DiagnosticsBridge(QObject):
 
     # ── Фоновый запуск ──
     def kickoff_refresh(self, force: bool = False) -> None:
-        """Запустить run_full_diagnostics в фоне (если ещё не запущен)."""
+        """Запустить run_full_diagnostics в фоне.
+
+        Повторные вызовы: без force — только один раз за жизнь моста;
+        c force — разрешены, но не одновременно с уже идущей проверкой
+        (два сабпроцесса-пробы, пишущих один cache-файл, нам не нужны).
+        """
         if self._refresh_started and not force:
             return
+        if self._running:
+            return
         self._refresh_started = True
+        self._running = True
         bridge = self
 
         def _worker():
@@ -135,49 +134,42 @@ class DiagnosticsBridge(QObject):
             except Exception as e:
                 results = {"_error": str(e)}
             bridge._results = results or {}
-
-            # Пока мы в фоне и знаем, что torch рабочий — безопасно
-            # импортировать его для определения CUDA (не раньше).
-            if results.get("torch") is True:
-                cuda_ok, cuda_name = _probe_cuda_in_torch()
-            else:
-                cuda_ok, cuda_name = False, ""
-
-            from PySide6.QtCore import QMetaObject, Qt
-
-            def _apply():
-                bridge._cuda_available = cuda_ok
-                bridge._cuda_device_name = cuda_name
-                bridge.cuda_info_changed.emit(cuda_ok, cuda_name)
-                bridge.diagnostics_updated.emit()
-
+            bridge._running = False
+            # ВАЖНО: здесь НЕТ импорта torch/CUDA и быть не должно —
+            # всё это уже сделал изолированный сабпроцесс диагностики,
+            # а мост читает cuda_available/cuda_name из JSON-результата.
             try:
                 QMetaObject.invokeMethod(
                     bridge, "_apply_in_gui", Qt.ConnectionType.QueuedConnection
                 )
             except Exception:
-                # invokeMethod с методом без аргументов работает стабильно
-                # через QMetaObject в PySide6; если вызов не сработал —
-                # откатываемся к прямому вызову (в худшем случае подписчики
-                # получат сигнал из фонового потока, что безопасно для
-                # большинства Qt‑операций чтения).
-                _apply()
+                # Нет очереди событий (не GUI-режим) — просто не эмитим.
+                pass
 
         threading.Thread(target=_worker, daemon=True, name="diag-refresh").start()
 
     @Slot()
     def _apply_in_gui(self) -> None:
-        # Этот слот вызывается через QueuedConnection в GUI‑потоке после
-        # завершения фоновой диагностики.
-        # Повторно читаем кэш с диска (run_full_diagnostics уже сохранил его).
-        try:
-            self._results = load_diagnostics_cache()
-        except Exception:
-            pass
+        # Выполняется в GUI‑потоке (QueuedConnection) после завершения
+        # фоновой диагностики. Читаем результат (или кэш с диска),
+        # обновляем CUDA‑поля и ТОЛЬКО ЗДЕСЬ испускаем сигналы —
+        # подписчики получают их в GUI‑потоке и могут трогать виджеты.
+        if not self._results:
+            try:
+                self._results = load_diagnostics_cache()
+            except Exception:
+                pass
+        res = self._results or {}
+        self._cuda_available = res.get("cuda_available") is True
+        name = res.get("cuda_name")
+        self._cuda_device_name = name if isinstance(name, str) else ""
+        self.cuda_info_changed.emit(self._cuda_available, self._cuda_device_name)
+        self.diagnostics_updated.emit()
 
 
 # Глобальный singleton, создаваемый по требованию (чтобы не требовался
-# QApplication на момент импорта модуля).
+# QApplication на момент импорта модуля). Создаётся в GUI‑потоке —
+# get_bridge() вызывается только из GUI‑кода (виджеты/окна/диалоги).
 _BRIDGE: Optional[DiagnosticsBridge] = None
 
 

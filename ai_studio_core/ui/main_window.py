@@ -81,6 +81,7 @@ class MainWindow(QMainWindow):
         self._setup_workspaces()
         self._setup_dock_panels()
         self._setup_status_bar()
+        self._setup_experience()
         self._wire_controllers()
         self._wire_settings()
         self._restore_layout()
@@ -94,7 +95,10 @@ class MainWindow(QMainWindow):
         # чтобы окно успело отрисоваться до того как subprocess стартанёт.
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
-        QTimer.singleShot(300, lambda: self._toast(tr("msg_welcome"), "info"))
+        QTimer.singleShot(300, lambda: (
+            self._toast(tr("msg_welcome"), "info"),
+            self._xp.handle(self._xp_events.APP_STARTED),
+        ))
 
     # ── Menu ──
     def _setup_menu_bar(self) -> None:
@@ -224,6 +228,95 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._resource_bar)
         self._resource_bar.set_message(tr("msg_ready"))
 
+    # ── Experience layer (уровни 1–2) ──
+    _EXP_SOUNDS_KEY = "ui/exp_sounds"
+    _EXP_ADAPTIVE_KEY = "ui/adaptive_start_tab"
+
+    @staticmethod
+    def _qs_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() not in ("false", "0", "none", "")
+
+    def _setup_experience(self) -> None:
+        from .experience import events as xp_events
+        from .experience import presets as xp_presets
+        from .experience import stats as xp_stats
+        from .experience.manager import ExperienceManager
+
+        self._xp_events = xp_events
+        self._xp_stats_mod = xp_stats
+        self._pulse_bar = None
+        self._had_running = False
+        self._suppress_activation_rec = False
+
+        self._xp = ExperienceManager(
+            toast_cb=lambda text, variant: self._toast(text, variant),
+            pulse_cb=self._pulse_accent,
+            status_cb=lambda msg: self._log_widget.append("WARN", msg),
+            parent=self,
+        )
+        try:
+            self._xp.configure(xp_presets.load_preset())
+        except Exception as e:
+            self._log_widget.append("WARN", f"experience preset invalid: {e}")
+        self._xp.set_sounds_enabled(
+            self._qs_bool(self._settings.value(self._EXP_SOUNDS_KEY, True)))
+
+        # Уровень 2: статистика + адаптивная стартовая вкладка
+        import time
+        self._session_t0 = time.time()
+        self._usage = xp_stats.UsageStats.load()
+        self._usage.record_session()
+        self._usage.save()
+        if self._qs_bool(self._settings.value(self._EXP_ADAPTIVE_KEY, True)):
+            ws, reason = xp_stats.suggested_start_workspace(self._usage)
+            idx = self._tab_index_for(ws)
+            if idx is not None:
+                self._suppress_activation_rec = True
+                self._workspace_tabs.setCurrentIndex(idx)
+                self._suppress_activation_rec = False
+            self._log_widget.append(
+                "INFO", f'{tr("exp_start_tab_reason")} {ws} ({reason})')
+
+    def _tab_index_for(self, workspace_id: str) -> int | None:
+        want = f"tab_{workspace_id}"
+        for idx, key in self._tab_map:
+            if key == want:
+                return idx
+        return None
+
+    def _pulse_accent(self, color: str, duration_ms: int) -> None:
+        from .experience.manager import AccentPulse
+        if self._pulse_bar is None:
+            self._pulse_bar = AccentPulse(self)
+        self._pulse_bar.pulse(color, duration_ms)
+
+    def _record_action(self, action: str) -> None:
+        try:
+            self._usage.record_action(action)
+            self._usage.save()
+        except Exception:
+            pass
+
+    def _on_tab_activated(self, idx: int) -> None:
+        if self._suppress_activation_rec:
+            return
+        for tab_idx, key in self._tab_map:
+            if tab_idx == idx:
+                try:
+                    self._usage.record_activation(key.removeprefix("tab_"))
+                    self._usage.save()
+                except Exception:
+                    pass
+                return
+
+    def _xp_queue_watch(self, tasks: list) -> None:
+        running = sum(1 for t in tasks if getattr(t, "status", "") == "running")
+        if self._had_running and running == 0:
+            self._xp.handle(self._xp_events.QUEUE_DRAINED)
+        self._had_running = running > 0
+
     # ── Settings → language/theme/paths ──
     def _wire_settings(self) -> None:
         sp = self._settings_widget
@@ -232,6 +325,11 @@ class MainWindow(QMainWindow):
         sp.language_changed.connect(self._on_language_changed)
         sp.settings_changed.connect(self._on_settings_changed)
         sp.paths_changed.connect(self._on_paths_changed)
+        # Тумблеры experience — из QSettings (без эмиссии)
+        sp.set_exp_options(
+            self._qs_bool(self._settings.value(self._EXP_SOUNDS_KEY, True)),
+            self._qs_bool(self._settings.value(self._EXP_ADAPTIVE_KEY, True)),
+        )
 
     def _on_language_changed(self, code: str) -> None:
         if not i18n.set_language(code):
@@ -248,6 +346,12 @@ class MainWindow(QMainWindow):
 
     def _on_settings_changed(self, settings: dict) -> None:
         self._app_settings = settings
+        if "exp_sounds" in settings:
+            self._xp.set_sounds_enabled(bool(settings["exp_sounds"]))
+            self._settings.setValue(self._EXP_SOUNDS_KEY, bool(settings["exp_sounds"]))
+        if "exp_adaptive_tab" in settings:
+            self._settings.setValue(self._EXP_ADAPTIVE_KEY,
+                                    bool(settings["exp_adaptive_tab"]))
 
     def _on_paths_changed(self, kind: str, path: str) -> None:
         self._log_widget.append("INFO", f"Path changed: {kind} -> {path}")
@@ -339,6 +443,24 @@ class MainWindow(QMainWindow):
         self._queue_ctrl.queue_changed.connect(
             lambda tasks: self._resource_bar.set_queue_size(len(tasks)))
         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
+
+        # Experience: реальные события контроллеров → пресеты
+        xp, ev = self._xp, self._xp_events
+        self._tts_ctrl.generation_complete.connect(
+            lambda _p: (xp.handle(ev.GENERATION_COMPLETE),
+                        self._usage.record_backend(self._tts_ctrl.backend()),
+                        self._usage.save()))
+        self._tts_ctrl.error_occurred.connect(lambda _m: xp.handle(ev.GENERATION_FAILED))
+        self._tts_ctrl.generation_started.connect(
+            lambda: self._record_action("tts_generate"))
+        self._chat_ctrl.generation_started.connect(
+            lambda: self._record_action("chat_send"))
+        self._chat_ctrl.message_received.connect(lambda _m: xp.handle(ev.CHAT_REPLY))
+        self._model_ctrl.download_finished.connect(
+            lambda name: (self._record_action("download"),
+                          xp.handle(ev.DOWNLOAD_FINISHED, {"output": name})))
+        self._queue_ctrl.queue_changed.connect(self._xp_queue_watch)
+        self._workspace_tabs.currentChanged.connect(self._on_tab_activated)
 
     def _refresh_chat_models(self) -> None:
         """Каталог моделей активного провайдера → селектор чата."""
@@ -435,6 +557,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._settings.setValue(self._WINDOW_GEOMETRY_KEY, self.saveGeometry())
         self._settings.setValue(self._WINDOW_STATE_KEY, self.saveState())
+        import time
+        try:
+            self._usage.record_active_seconds(time.time() - self._session_t0)
+            self._usage.save()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ── Project persistence (реальный JSON, без диалогов для тестов) ──
@@ -478,6 +606,8 @@ class MainWindow(QMainWindow):
         import json
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self._serialize_project(), f, ensure_ascii=False, indent=2)
+        self._record_action("project_save")
+        self._xp.handle(self._xp_events.PROJECT_SAVED, {"output": path})
         return path
 
     def load_project_from(self, path: str) -> str:
@@ -485,6 +615,8 @@ class MainWindow(QMainWindow):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self._apply_project(data)
+        self._record_action("project_load")
+        self._xp.handle(self._xp_events.PROJECT_LOADED, {"output": path})
         return path
 
     def _clear_project(self) -> None:
@@ -493,6 +625,7 @@ class MainWindow(QMainWindow):
         self._chat_workspace.load_messages([])
         self._chat_workspace.set_system_prompt("")
         self._pipeline_workspace._input.setPlainText("")
+        self._xp.handle(self._xp_events.PROJECT_NEW)
 
     # ── Menu slots ──
     def _on_new_project(self) -> None:
@@ -558,6 +691,8 @@ class MainWindow(QMainWindow):
             return
         self._toast(f'{tr("ctl_export_done")}\n{out}', "success")
         self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
+        self._record_action("export")
+        self._xp.handle(self._xp_events.EXPORT_DONE, {"output": out})
 
     def _on_manage_models(self) -> None:
         # Поднимаем реальный Model Hub dock и обновляем скан

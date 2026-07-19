@@ -68,6 +68,12 @@ class SettingsPanel(QWidget):
         self._auto_save = QCheckBox()
         self._auto_save.setChecked(True)
         gen_form.addRow(self._auto_save)
+        self._exp_sounds = QCheckBox()
+        self._exp_sounds.setChecked(True)
+        gen_form.addRow(self._exp_sounds)
+        self._exp_adaptive = QCheckBox()
+        self._exp_adaptive.setChecked(True)
+        gen_form.addRow(self._exp_adaptive)
         self._gen_group.set_content_layout(gen_form)
         layout.addWidget(self._gen_group)
 
@@ -159,6 +165,8 @@ class SettingsPanel(QWidget):
         self._threads.valueChanged.connect(lambda _v: self._emit_settings())
         self._batch.valueChanged.connect(lambda _v: self._emit_settings())
         self._auto_save.toggled.connect(lambda _v: self._emit_settings())
+        self._exp_sounds.toggled.connect(lambda _v: self._emit_settings())
+        self._exp_adaptive.toggled.connect(lambda _v: self._emit_settings())
 
         self.retranslate_ui()
 
@@ -192,12 +200,23 @@ class SettingsPanel(QWidget):
             "worker_threads": self._threads.value(),
             "batch_size": self._batch.value(),
             "auto_save": self._auto_save.isChecked(),
+            "exp_sounds": self._exp_sounds.isChecked(),
+            "exp_adaptive_tab": self._exp_adaptive.isChecked(),
             "models_dir": self._dirs["models"],
             "output_dir": self._dirs["output"],
         }
 
     def language(self) -> str:
         return self._lang.currentData() or "en"
+
+    def set_exp_options(self, sounds: bool, adaptive_tab: bool) -> None:
+        """Программно выставляет тумблеры experience-слоя (без эмиссии)."""
+        self._exp_sounds.blockSignals(True)
+        self._exp_adaptive.blockSignals(True)
+        self._exp_sounds.setChecked(bool(sounds))
+        self._exp_adaptive.setChecked(bool(adaptive_tab))
+        self._exp_sounds.blockSignals(False)
+        self._exp_adaptive.blockSignals(False)
 
     def set_language(self, code: str) -> None:
         """Программно выставляет язык в комбобоксе (без эмиссии сигналов)."""
@@ -219,6 +238,8 @@ class SettingsPanel(QWidget):
         self._theme.setItemText(0, tr("theme_dark"))
         self._lang_lbl.setText(tr("set_language"))
         self._auto_save.setText(tr("set_autosave"))
+        self._exp_sounds.setText(tr("exp_sounds"))
+        self._exp_adaptive.setText(tr("exp_adaptive_tab"))
         self._perf_group.set_title(tr("set_performance"))
         self._device_lbl.setText(tr("set_device"))
         self._device.setItemText(0, tr("device_auto"))
