@@ -16,6 +16,11 @@ from .theme.palette import make_dark_palette
 
 _LANGUAGE_KEY = "ui/language"
 
+# Ссылка на Qt message handler ДОЛЖНА жить вечно: qInstallMessageHandler
+# хранит только голый указатель, и если callable соберёт GC, первое же
+# сообщение Qt позовёт освобождённый объект -> access violation.
+_QT_MSG_HANDLER = None
+
 
 def _install_qt_log_handler() -> None:
     """Все предупреждения Qt -> logs/xtts_studio.log.
@@ -24,6 +29,7 @@ def _install_qt_log_handler() -> None:
     и т.п.) Qt почти всегда печатает warning в консоль — в GUI из консоли
     его не прочитать, поэтому перенаправляем в файл лога.
     """
+    global _QT_MSG_HANDLER
     from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 
     levels = {
@@ -40,6 +46,7 @@ def _install_qt_log_handler() -> None:
         except Exception:
             pass
 
+    _QT_MSG_HANDLER = _handler
     qInstallMessageHandler(_handler)
 
 
