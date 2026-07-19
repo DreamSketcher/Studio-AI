@@ -1,0 +1,951 @@
+From 7fadf74851e33572d98727ea7bff4c1cc790f15c Mon Sep 17 00:00:00 2001
+From: arena-agent <agent@local>
+Date: Sun, 19 Jul 2026 10:08:54 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20=E2=80=94=20access=20violation:=20CUDA=20?=
+ =?UTF-8?q?probed=20only=20in=20isolated=20diagnostics=20subprocess=20(no?=
+ =?UTF-8?q?=20torch=20import=20in=20GUI=20process,=20ever);=20bridge=20sig?=
+ =?UTF-8?q?nals=20emitted=20exactly=20once=20from=20GUI=20thread;=20restor?=
+ =?UTF-8?q?e=20Stage-12=20experience=20wiring=20in=20MainWindow/SettingsPa?=
+ =?UTF-8?q?nel;=20+14=20tests?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ ai_studio_core/env_core/diagnostics.py     |  49 ++++-
+ ai_studio_core/ui/diag_bridge.py           | 106 +++++------
+ ai_studio_core/ui/main_window.py           | 137 +++++++++++++-
+ ai_studio_core/ui/panels/settings_panel.py |  21 +++
+ test/test_diag_bridge.py                   | 200 +++++++++++++++++++++
+ test/test_diagnostics_cuda.py              | 160 +++++++++++++++++
+ 6 files changed, 612 insertions(+), 61 deletions(-)
+ create mode 100644 test/test_diag_bridge.py
+ create mode 100644 test/test_diagnostics_cuda.py
+
+diff --git a/ai_studio_core/env_core/diagnostics.py b/ai_studio_core/env_core/diagnostics.py
+index f44c7cf..374ce60 100644
+--- a/ai_studio_core/env_core/diagnostics.py
++++ b/ai_studio_core/env_core/diagnostics.py
+@@ -66,7 +66,11 @@ def load_diagnostics_cache() -> dict:
+         with open(DIAG_CACHE_PATH, "r", encoding="utf-8") as f:
+             data = json.load(f)
+         if isinstance(data, dict) and isinstance(data.get("results"), dict):
+-            return data["results"]
++            res = dict(data["results"])
++            cuda = data.get("cuda") or {}
++            res["cuda_available"] = bool(cuda.get("available"))
++            res["cuda_name"] = str(cuda.get("name") or "")
++            return res
+     except Exception as e:
+         write_log(f"[Diagnostics] Не удалось прочитать кэш диагностики: {e}")
+     return {}
+@@ -545,7 +549,11 @@ def run_full_diagnostics(force_refresh=False) -> dict:
+                     and cache.get("site_packages_count") == current_count
+                     and "results" in cache
+                 ):
+-                    return cache["results"]
++                    res = dict(cache["results"])
++                    cuda = cache.get("cuda") or {}
++                    res["cuda_available"] = bool(cuda.get("available"))
++                    res["cuda_name"] = str(cuda.get("name") or "")
++                    return res
+         except Exception as e:
+             write_log(f"[Diagnostics] Ошибка проверки кэша диагностики: {e}")
+ 
+@@ -658,6 +666,22 @@ try:
+ except Exception as e:
+     results['rvc_python'] = str(e)
+ 
++# CUDA-инфо опрашиваем ТОЛЬКО в этом изолированном сабпроцессе.
++# В GUI-процессе torch не импортируется никогда: access violation на битом
++# torch убивает процесс целиком, из какого бы потока ни был импорт.
++cuda_info = {"available": False, "name": ""}
++if results.get('torch') is True:
++    try:
++        cuda_info["available"] = bool(torch.cuda.is_available())
++        if cuda_info["available"]:
++            try:
++                cuda_info["name"] = str(torch.cuda.get_device_name(0))
++            except Exception:
++                cuda_info["name"] = "CUDA"
++    except Exception:
++        pass
++
++print("CUDA_RESULT=" + json.dumps(cuda_info))
+ print("SUB_RESULT=" + json.dumps(results))
+ """
+         % clean_site_packages
+@@ -678,6 +702,7 @@ print("SUB_RESULT=" + json.dumps(results))
+         "rvc_python",
+     )
+     results = {}
++    cuda_info = {"available": False, "name": ""}
+     try:
+         env = os.environ.copy()
+         # Таймаут увеличен относительно прежнего (30с хватало только на
+@@ -688,11 +713,23 @@ print("SUB_RESULT=" + json.dumps(results))
+         )
+         out = proc.stdout or ""
+         found = False
++        _cuda_raw = None
+         for line in out.splitlines():
+             if line.startswith("SUB_RESULT="):
+                 results = json.loads(line.split("=", 1)[1])
+                 found = True
+-                break
++            elif line.startswith("CUDA_RESULT="):
++                try:
++                    _cuda_raw = json.loads(line.split("=", 1)[1])
++                except Exception:
++                    pass
++        if isinstance(_cuda_raw, dict):
++            # CUDA признаём доступной только если сам torch жив — флаг из
++            # прошлой жизни сабпроцесса не должен солгать при битом torch.
++            cuda_info["available"] = (
++                bool(_cuda_raw.get("available")) and results.get("torch") is True
++            )
++            cuda_info["name"] = str(_cuda_raw.get("name") or "")
+ 
+         if not found:
+             err_text = f"Subprocess failed: {proc.stderr or out}"
+@@ -719,6 +756,7 @@ print("SUB_RESULT=" + json.dumps(results))
+                 "timestamp": time.time(),
+                 "results": results,
+             }
++            cache_data["cuda"] = cuda_info
+             with open(DIAG_CACHE_PATH, "w", encoding="utf-8") as f:
+                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
+             write_log("[Diagnostics] Результаты диагностики успешно закэшированы.")
+@@ -727,6 +765,11 @@ print("SUB_RESULT=" + json.dumps(results))
+     else:
+         clear_diagnostics_cache()
+ 
++    # CUDA-ключи прилагаем ПОСЛЕ проверки is_all_ok и только в памяти —
++    # они не участвуют в критерии "всё ли работает" и не пишутся в
++    # cache["results"] (для них отдельный блок cache["cuda"]).
++    results["cuda_available"] = bool(cuda_info.get("available"))
++    results["cuda_name"] = str(cuda_info.get("name") or "")
+     return results
+ 
+ 
+diff --git a/ai_studio_core/ui/diag_bridge.py b/ai_studio_core/ui/diag_bridge.py
+index 481266a..d2ce201 100644
+--- a/ai_studio_core/ui/diag_bridge.py
++++ b/ai_studio_core/ui/diag_bridge.py
+@@ -10,16 +10,20 @@
+     чтобы все подписчики (селекторы моделей, статус‑бар, визард, панель
+     настроек) перечитали кэш и перерисовались.
+ 
+-Это убирает ВСЕ синхронные `import torch`/`import TTS` с пути старта окна
+-MainWindow.__init__, из‑за которых битый torch убивал GUI‑процесс ещё до
+-window.show().
++КРИТИЧЕСКОЕ ПРАВИЛО: в ЭТОМ процессе (GUI) torch/TTS/CUDA не импортируются
++НИКОГДА — ни на старте окна, ни в фоновом потоке. Access violation при
++импорте битого torch убивает процесс целиком из любого потока, поэтому
++«перенести импорт в поток» нельзя — можно только перенести его в другой
++процесс. Все импорты (включая опрос CUDA) делает изолированный сабпроцесс
++внутри env_core.diagnostics.run_full_diagnostics(); GUI читает только
++JSON-результаты (поля cuda_available/cuda_name).
+ """
+ from __future__ import annotations
+ 
+ import threading
+ from typing import Optional
+ 
+-from PySide6.QtCore import QObject, Signal, Slot
++from PySide6.QtCore import QMetaObject, QObject, Qt, Signal, Slot
+ 
+ from ai_studio_core.env_core.diagnostics import (
+     load_diagnostics_cache,
+@@ -69,36 +73,23 @@ def diffusers_available() -> bool:
+         return False
+ 
+ 
+-def _probe_cuda_in_torch() -> tuple[bool, str]:
+-    """Импортирует torch и смотрит torch.cuda.is_available().
++class DiagnosticsBridge(QObject):
++    """Одиночный мост: один фоновый запуск диагностики, два сигнала.
+ 
+-    Вызывается ИСКЛЮЧИТЕЛЬНО из фонового потока (DiagnosticsBridge) ПОСЛЕ
+-    того как run_full_diagnostics подтвердила, что torch рабочий — т.е.
+-    в момент, когда import torch не должен уронить процесс. Даже если упадёт,
+-    это произойдёт в фоне и не повлияет на старт GUI.
++    Сигналы (diagnostics_updated / cuda_info_changed) испускаются строго
++    из GUI‑потока через QueuedConnection-слот _apply_in_gui — подписчики
++    могут безопасно трогать виджеты. Сам QObject создаётся в GUI‑потоке
++    (get_bridge() вызывается из конструкторов виджетов), поэтому queued
++    доставка гарантирована его очередью событий.
+     """
+-    try:
+-        import torch  # noqa: F811
+-        if torch.cuda.is_available():
+-            try:
+-                name = torch.cuda.get_device_name(0)
+-            except Exception:
+-                name = "CUDA"
+-            return True, name
+-        return False, ""
+-    except Exception:
+-        return False, ""
+ 
+-
+-class DiagnosticsBridge(QObject):
+-    """Одиночный мост: один фоновый запуск диагностики, один сигнал."""
+-
+-    diagnostics_updated = Signal()   # без аргументов: подписчики читают cached_results()
++    diagnostics_updated = Signal()        # подписчики читают cached_results()
+     cuda_info_changed = Signal(bool, str)  # (available, device_name)
+ 
+     def __init__(self, parent: QObject | None = None):
+         super().__init__(parent)
+         self._refresh_started = False
++        self._running = False
+         self._results: dict = {}
+         self._cuda_available: bool = False
+         self._cuda_device_name: str = ""
+@@ -123,10 +114,18 @@ class DiagnosticsBridge(QObject):
+ 
+     # ── Фоновый запуск ──
+     def kickoff_refresh(self, force: bool = False) -> None:
+-        """Запустить run_full_diagnostics в фоне (если ещё не запущен)."""
++        """Запустить run_full_diagnostics в фоне.
++
++        Повторные вызовы: без force — только один раз за жизнь моста;
++        c force — разрешены, но не одновременно с уже идущей проверкой
++        (два сабпроцесса-пробы, пишущих один cache-файл, нам не нужны).
++        """
+         if self._refresh_started and not force:
+             return
++        if self._running:
++            return
+         self._refresh_started = True
++        self._running = True
+         bridge = self
+ 
+         def _worker():
+@@ -135,49 +134,42 @@ class DiagnosticsBridge(QObject):
+             except Exception as e:
+                 results = {"_error": str(e)}
+             bridge._results = results or {}
+-
+-            # Пока мы в фоне и знаем, что torch рабочий — безопасно
+-            # импортировать его для определения CUDA (не раньше).
+-            if results.get("torch") is True:
+-                cuda_ok, cuda_name = _probe_cuda_in_torch()
+-            else:
+-                cuda_ok, cuda_name = False, ""
+-
+-            from PySide6.QtCore import QMetaObject, Qt
+-
+-            def _apply():
+-                bridge._cuda_available = cuda_ok
+-                bridge._cuda_device_name = cuda_name
+-                bridge.cuda_info_changed.emit(cuda_ok, cuda_name)
+-                bridge.diagnostics_updated.emit()
+-
++            bridge._running = False
++            # ВАЖНО: здесь НЕТ импорта torch/CUDA и быть не должно —
++            # всё это уже сделал изолированный сабпроцесс диагностики,
++            # а мост читает cuda_available/cuda_name из JSON-результата.
+             try:
+                 QMetaObject.invokeMethod(
+                     bridge, "_apply_in_gui", Qt.ConnectionType.QueuedConnection
+                 )
+             except Exception:
+-                # invokeMethod с методом без аргументов работает стабильно
+-                # через QMetaObject в PySide6; если вызов не сработал —
+-                # откатываемся к прямому вызову (в худшем случае подписчики
+-                # получат сигнал из фонового потока, что безопасно для
+-                # большинства Qt‑операций чтения).
+-                _apply()
++                # Нет очереди событий (не GUI-режим) — просто не эмитим.
++                pass
+ 
+         threading.Thread(target=_worker, daemon=True, name="diag-refresh").start()
+ 
+     @Slot()
+     def _apply_in_gui(self) -> None:
+-        # Этот слот вызывается через QueuedConnection в GUI‑потоке после
+-        # завершения фоновой диагностики.
+-        # Повторно читаем кэш с диска (run_full_diagnostics уже сохранил его).
+-        try:
+-            self._results = load_diagnostics_cache()
+-        except Exception:
+-            pass
++        # Выполняется в GUI‑потоке (QueuedConnection) после завершения
++        # фоновой диагностики. Читаем результат (или кэш с диска),
++        # обновляем CUDA‑поля и ТОЛЬКО ЗДЕСЬ испускаем сигналы —
++        # подписчики получают их в GUI‑потоке и могут трогать виджеты.
++        if not self._results:
++            try:
++                self._results = load_diagnostics_cache()
++            except Exception:
++                pass
++        res = self._results or {}
++        self._cuda_available = res.get("cuda_available") is True
++        name = res.get("cuda_name")
++        self._cuda_device_name = name if isinstance(name, str) else ""
++        self.cuda_info_changed.emit(self._cuda_available, self._cuda_device_name)
++        self.diagnostics_updated.emit()
+ 
+ 
+ # Глобальный singleton, создаваемый по требованию (чтобы не требовался
+-# QApplication на момент импорта модуля).
++# QApplication на момент импорта модуля). Создаётся в GUI‑потоке —
++# get_bridge() вызывается только из GUI‑кода (виджеты/окна/диалоги).
+ _BRIDGE: Optional[DiagnosticsBridge] = None
+ 
+ 
+diff --git a/ai_studio_core/ui/main_window.py b/ai_studio_core/ui/main_window.py
+index 6021cfb..bf35615 100644
+--- a/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ui/main_window.py
+@@ -81,6 +81,7 @@ class MainWindow(QMainWindow):
+         self._setup_workspaces()
+         self._setup_dock_panels()
+         self._setup_status_bar()
++        self._setup_experience()
+         self._wire_controllers()
+         self._wire_settings()
+         self._restore_layout()
+@@ -94,7 +95,10 @@ class MainWindow(QMainWindow):
+         # чтобы окно успело отрисоваться до того как subprocess стартанёт.
+         from PySide6.QtCore import QTimer
+         QTimer.singleShot(0, lambda: bridge.kickoff_refresh(force=False))
+-        QTimer.singleShot(300, lambda: self._toast(tr("msg_welcome"), "info"))
++        QTimer.singleShot(300, lambda: (
++            self._toast(tr("msg_welcome"), "info"),
++            self._xp.handle(self._xp_events.APP_STARTED),
++        ))
+ 
+     # ── Menu ──
+     def _setup_menu_bar(self) -> None:
+@@ -224,6 +228,95 @@ class MainWindow(QMainWindow):
+         self.setStatusBar(self._resource_bar)
+         self._resource_bar.set_message(tr("msg_ready"))
+ 
++    # ── Experience layer (уровни 1–2) ──
++    _EXP_SOUNDS_KEY = "ui/exp_sounds"
++    _EXP_ADAPTIVE_KEY = "ui/adaptive_start_tab"
++
++    @staticmethod
++    def _qs_bool(value) -> bool:
++        if isinstance(value, bool):
++            return value
++        return str(value).lower() not in ("false", "0", "none", "")
++
++    def _setup_experience(self) -> None:
++        from .experience import events as xp_events
++        from .experience import presets as xp_presets
++        from .experience import stats as xp_stats
++        from .experience.manager import ExperienceManager
++
++        self._xp_events = xp_events
++        self._xp_stats_mod = xp_stats
++        self._pulse_bar = None
++        self._had_running = False
++        self._suppress_activation_rec = False
++
++        self._xp = ExperienceManager(
++            toast_cb=lambda text, variant: self._toast(text, variant),
++            pulse_cb=self._pulse_accent,
++            status_cb=lambda msg: self._log_widget.append("WARN", msg),
++            parent=self,
++        )
++        try:
++            self._xp.configure(xp_presets.load_preset())
++        except Exception as e:
++            self._log_widget.append("WARN", f"experience preset invalid: {e}")
++        self._xp.set_sounds_enabled(
++            self._qs_bool(self._settings.value(self._EXP_SOUNDS_KEY, True)))
++
++        # Уровень 2: статистика + адаптивная стартовая вкладка
++        import time
++        self._session_t0 = time.time()
++        self._usage = xp_stats.UsageStats.load()
++        self._usage.record_session()
++        self._usage.save()
++        if self._qs_bool(self._settings.value(self._EXP_ADAPTIVE_KEY, True)):
++            ws, reason = xp_stats.suggested_start_workspace(self._usage)
++            idx = self._tab_index_for(ws)
++            if idx is not None:
++                self._suppress_activation_rec = True
++                self._workspace_tabs.setCurrentIndex(idx)
++                self._suppress_activation_rec = False
++            self._log_widget.append(
++                "INFO", f'{tr("exp_start_tab_reason")} {ws} ({reason})')
++
++    def _tab_index_for(self, workspace_id: str) -> int | None:
++        want = f"tab_{workspace_id}"
++        for idx, key in self._tab_map:
++            if key == want:
++                return idx
++        return None
++
++    def _pulse_accent(self, color: str, duration_ms: int) -> None:
++        from .experience.manager import AccentPulse
++        if self._pulse_bar is None:
++            self._pulse_bar = AccentPulse(self)
++        self._pulse_bar.pulse(color, duration_ms)
++
++    def _record_action(self, action: str) -> None:
++        try:
++            self._usage.record_action(action)
++            self._usage.save()
++        except Exception:
++            pass
++
++    def _on_tab_activated(self, idx: int) -> None:
++        if self._suppress_activation_rec:
++            return
++        for tab_idx, key in self._tab_map:
++            if tab_idx == idx:
++                try:
++                    self._usage.record_activation(key.removeprefix("tab_"))
++                    self._usage.save()
++                except Exception:
++                    pass
++                return
++
++    def _xp_queue_watch(self, tasks: list) -> None:
++        running = sum(1 for t in tasks if getattr(t, "status", "") == "running")
++        if self._had_running and running == 0:
++            self._xp.handle(self._xp_events.QUEUE_DRAINED)
++        self._had_running = running > 0
++
+     # ── Settings → language/theme/paths ──
+     def _wire_settings(self) -> None:
+         sp = self._settings_widget
+@@ -232,6 +325,11 @@ class MainWindow(QMainWindow):
+         sp.language_changed.connect(self._on_language_changed)
+         sp.settings_changed.connect(self._on_settings_changed)
+         sp.paths_changed.connect(self._on_paths_changed)
++        # Тумблеры experience — из QSettings (без эмиссии)
++        sp.set_exp_options(
++            self._qs_bool(self._settings.value(self._EXP_SOUNDS_KEY, True)),
++            self._qs_bool(self._settings.value(self._EXP_ADAPTIVE_KEY, True)),
++        )
+ 
+     def _on_language_changed(self, code: str) -> None:
+         if not i18n.set_language(code):
+@@ -248,6 +346,12 @@ class MainWindow(QMainWindow):
+ 
+     def _on_settings_changed(self, settings: dict) -> None:
+         self._app_settings = settings
++        if "exp_sounds" in settings:
++            self._xp.set_sounds_enabled(bool(settings["exp_sounds"]))
++            self._settings.setValue(self._EXP_SOUNDS_KEY, bool(settings["exp_sounds"]))
++        if "exp_adaptive_tab" in settings:
++            self._settings.setValue(self._EXP_ADAPTIVE_KEY,
++                                    bool(settings["exp_adaptive_tab"]))
+ 
+     def _on_paths_changed(self, kind: str, path: str) -> None:
+         self._log_widget.append("INFO", f"Path changed: {kind} -> {path}")
+@@ -340,6 +444,24 @@ class MainWindow(QMainWindow):
+             lambda tasks: self._resource_bar.set_queue_size(len(tasks)))
+         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
+ 
++        # Experience: реальные события контроллеров → пресеты
++        xp, ev = self._xp, self._xp_events
++        self._tts_ctrl.generation_complete.connect(
++            lambda _p: (xp.handle(ev.GENERATION_COMPLETE),
++                        self._usage.record_backend(self._tts_ctrl.backend()),
++                        self._usage.save()))
++        self._tts_ctrl.error_occurred.connect(lambda _m: xp.handle(ev.GENERATION_FAILED))
++        self._tts_ctrl.generation_started.connect(
++            lambda: self._record_action("tts_generate"))
++        self._chat_ctrl.generation_started.connect(
++            lambda: self._record_action("chat_send"))
++        self._chat_ctrl.message_received.connect(lambda _m: xp.handle(ev.CHAT_REPLY))
++        self._model_ctrl.download_finished.connect(
++            lambda name: (self._record_action("download"),
++                          xp.handle(ev.DOWNLOAD_FINISHED, {"output": name})))
++        self._queue_ctrl.queue_changed.connect(self._xp_queue_watch)
++        self._workspace_tabs.currentChanged.connect(self._on_tab_activated)
++
+     def _refresh_chat_models(self) -> None:
+         """Каталог моделей активного провайдера → селектор чата."""
+         try:
+@@ -435,6 +557,12 @@ class MainWindow(QMainWindow):
+     def closeEvent(self, event) -> None:
+         self._settings.setValue(self._WINDOW_GEOMETRY_KEY, self.saveGeometry())
+         self._settings.setValue(self._WINDOW_STATE_KEY, self.saveState())
++        import time
++        try:
++            self._usage.record_active_seconds(time.time() - self._session_t0)
++            self._usage.save()
++        except Exception:
++            pass
+         super().closeEvent(event)
+ 
+     # ── Project persistence (реальный JSON, без диалогов для тестов) ──
+@@ -478,6 +606,8 @@ class MainWindow(QMainWindow):
+         import json
+         with open(path, "w", encoding="utf-8") as f:
+             json.dump(self._serialize_project(), f, ensure_ascii=False, indent=2)
++        self._record_action("project_save")
++        self._xp.handle(self._xp_events.PROJECT_SAVED, {"output": path})
+         return path
+ 
+     def load_project_from(self, path: str) -> str:
+@@ -485,6 +615,8 @@ class MainWindow(QMainWindow):
+         with open(path, "r", encoding="utf-8") as f:
+             data = json.load(f)
+         self._apply_project(data)
++        self._record_action("project_load")
++        self._xp.handle(self._xp_events.PROJECT_LOADED, {"output": path})
+         return path
+ 
+     def _clear_project(self) -> None:
+@@ -493,6 +625,7 @@ class MainWindow(QMainWindow):
+         self._chat_workspace.load_messages([])
+         self._chat_workspace.set_system_prompt("")
+         self._pipeline_workspace._input.setPlainText("")
++        self._xp.handle(self._xp_events.PROJECT_NEW)
+ 
+     # ── Menu slots ──
+     def _on_new_project(self) -> None:
+@@ -558,6 +691,8 @@ class MainWindow(QMainWindow):
+             return
+         self._toast(f'{tr("ctl_export_done")}\n{out}', "success")
+         self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
++        self._record_action("export")
++        self._xp.handle(self._xp_events.EXPORT_DONE, {"output": out})
+ 
+     def _on_manage_models(self) -> None:
+         # Поднимаем реальный Model Hub dock и обновляем скан
+diff --git a/ai_studio_core/ui/panels/settings_panel.py b/ai_studio_core/ui/panels/settings_panel.py
+index d159970..761c63b 100644
+--- a/ai_studio_core/ui/panels/settings_panel.py
++++ b/ai_studio_core/ui/panels/settings_panel.py
+@@ -68,6 +68,12 @@ class SettingsPanel(QWidget):
+         self._auto_save = QCheckBox()
+         self._auto_save.setChecked(True)
+         gen_form.addRow(self._auto_save)
++        self._exp_sounds = QCheckBox()
++        self._exp_sounds.setChecked(True)
++        gen_form.addRow(self._exp_sounds)
++        self._exp_adaptive = QCheckBox()
++        self._exp_adaptive.setChecked(True)
++        gen_form.addRow(self._exp_adaptive)
+         self._gen_group.set_content_layout(gen_form)
+         layout.addWidget(self._gen_group)
+ 
+@@ -159,6 +165,8 @@ class SettingsPanel(QWidget):
+         self._threads.valueChanged.connect(lambda _v: self._emit_settings())
+         self._batch.valueChanged.connect(lambda _v: self._emit_settings())
+         self._auto_save.toggled.connect(lambda _v: self._emit_settings())
++        self._exp_sounds.toggled.connect(lambda _v: self._emit_settings())
++        self._exp_adaptive.toggled.connect(lambda _v: self._emit_settings())
+ 
+         self.retranslate_ui()
+ 
+@@ -192,6 +200,8 @@ class SettingsPanel(QWidget):
+             "worker_threads": self._threads.value(),
+             "batch_size": self._batch.value(),
+             "auto_save": self._auto_save.isChecked(),
++            "exp_sounds": self._exp_sounds.isChecked(),
++            "exp_adaptive_tab": self._exp_adaptive.isChecked(),
+             "models_dir": self._dirs["models"],
+             "output_dir": self._dirs["output"],
+         }
+@@ -199,6 +209,15 @@ class SettingsPanel(QWidget):
+     def language(self) -> str:
+         return self._lang.currentData() or "en"
+ 
++    def set_exp_options(self, sounds: bool, adaptive_tab: bool) -> None:
++        """Программно выставляет тумблеры experience-слоя (без эмиссии)."""
++        self._exp_sounds.blockSignals(True)
++        self._exp_adaptive.blockSignals(True)
++        self._exp_sounds.setChecked(bool(sounds))
++        self._exp_adaptive.setChecked(bool(adaptive_tab))
++        self._exp_sounds.blockSignals(False)
++        self._exp_adaptive.blockSignals(False)
++
+     def set_language(self, code: str) -> None:
+         """Программно выставляет язык в комбобоксе (без эмиссии сигналов)."""
+         idx = self._lang.findData(code)
+@@ -219,6 +238,8 @@ class SettingsPanel(QWidget):
+         self._theme.setItemText(0, tr("theme_dark"))
+         self._lang_lbl.setText(tr("set_language"))
+         self._auto_save.setText(tr("set_autosave"))
++        self._exp_sounds.setText(tr("exp_sounds"))
++        self._exp_adaptive.setText(tr("exp_adaptive_tab"))
+         self._perf_group.set_title(tr("set_performance"))
+         self._device_lbl.setText(tr("set_device"))
+         self._device.setItemText(0, tr("device_auto"))
+diff --git a/test/test_diag_bridge.py b/test/test_diag_bridge.py
+new file mode 100644
+index 0000000..643d64a
+--- /dev/null
++++ b/test/test_diag_bridge.py
+@@ -0,0 +1,200 @@
++# -*- coding: utf-8 -*-
++"""DiagnosticsBridge (фикс access violation на Windows):
++
++* CUDA-инфо приходит из изолированного сабпроцесса диагностики
++  (поля cuda_available/cuda_name в результатах/кэше) — в GUI-процессе
++  torch не импортируется НИКОГДА (ни в main, ни в фоновом потоке);
++* сигналы diagnostics_updated / cuda_info_changed испускаются строго
++  из GUI-потока (queued-слот), ровно один раз на одну проверку;
++* повторные kickoff не плодят параллельные сабпроцессы.
++"""
++from __future__ import annotations
++
++import os
++import re
++import threading
++import time
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="мост диагностики — Qt")
++
++from PySide6.QtWidgets import QApplication  # noqa: E402
++
++from ai_studio_core.ui import diag_bridge as bridge_mod  # noqa: E402
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++@pytest.fixture()
++def fresh_bridge():
++    """Чистый singleton на каждый тест."""
++    bridge_mod._BRIDGE = None
++    yield bridge_mod
++    bridge_mod._BRIDGE = None
++
++
++def _wait(app, cond, timeout=6.0) -> bool:
++    t0 = time.time()
++    while time.time() - t0 < timeout:
++        app.processEvents()
++        if cond():
++            return True
++        time.sleep(0.01)
++    return False
++
++
++class _SignalBag:
++    def __init__(self, bridge):
++        self.diag = 0
++        self.cuda = []
++        bridge.diagnostics_updated.connect(lambda: setattr(self, "diag", self.diag + 1))
++        bridge.cuda_info_changed.connect(lambda ok, name: self.cuda.append((ok, name)))
++
++
++class TestWorkerSignals:
++    def test_signals_once_and_cuda_from_results(self, app, fresh_bridge, monkeypatch):
++        calls = {"n": 0}
++
++        def fake_run(force_refresh=False):
++            calls["n"] += 1
++            assert force_refresh is False
++            return {"torch": True, "tts": True,
++                    "cuda_available": True, "cuda_name": "NVIDIA Fake RTX"}
++
++        monkeypatch.setattr(fresh_bridge, "run_full_diagnostics", fake_run)
++        bridge = fresh_bridge.get_bridge()
++        bag = _SignalBag(bridge)
++
++        bridge.kickoff_refresh(force=False)
++        assert _wait(app, lambda: bag.diag == 1), "нет diagnostics_updated после завершения"
++
++        assert bag.cuda == [(True, "NVIDIA Fake RTX")]
++        assert bridge.cuda_available() is True
++        assert bridge.cuda_device_name() == "NVIDIA Fake RTX"
++        assert bridge.component_ok("torch") is True
++        assert calls["n"] == 1
++
++        # Повторный kickoff без force — не повторяет проверку
++        bridge.kickoff_refresh(force=False)
++        _wait(app, lambda: bag.diag > 1, timeout=0.5)
++        assert bag.diag == 1
++        assert calls["n"] == 1
++
++    def test_force_reruns_after_finish(self, app, fresh_bridge, monkeypatch):
++        calls = {"n": 0}
++        monkeypatch.setattr(
++            fresh_bridge, "run_full_diagnostics",
++            lambda force_refresh=False: calls.__setitem__("n", calls["n"] + 1) or {})
++        bridge = fresh_bridge.get_bridge()
++        bag = _SignalBag(bridge)
++
++        bridge.kickoff_refresh(force=False)
++        assert _wait(app, lambda: bag.diag == 1)
++        bridge.kickoff_refresh(force=True)
++        assert _wait(app, lambda: bag.diag == 2)
++        assert calls["n"] == 2
++
++    def test_error_path_still_signals_and_no_cuda(self, app, fresh_bridge, monkeypatch):
++        def fake_run(force_refresh=False):
++            raise RuntimeError("boom")
++
++        monkeypatch.setattr(fresh_bridge, "run_full_diagnostics", fake_run)
++        bridge = fresh_bridge.get_bridge()
++        bag = _SignalBag(bridge)
++
++        bridge.kickoff_refresh(force=False)
++        assert _wait(app, lambda: bag.diag == 1)
++        assert bag.cuda == [(False, "")]
++        assert bridge.cuda_available() is False
++        assert bridge.component_ok("torch") is False
++        assert "boom" in str(bridge.cached_results().get("_error"))
++
++    def test_no_concurrent_refresh(self, app, fresh_bridge, monkeypatch):
++        entered = threading.Event()
++        release = threading.Event()
++        calls = {"n": 0}
++
++        def slow_run(force_refresh=False):
++            calls["n"] += 1
++            entered.set()
++            assert release.wait(5), "тест не отпустил рабочий поток"
++            return {"torch": False}
++
++        monkeypatch.setattr(fresh_bridge, "run_full_diagnostics", slow_run)
++        bridge = fresh_bridge.get_bridge()
++        bag = _SignalBag(bridge)
++
++        bridge.kickoff_refresh(force=True)
++        t0 = time.time()
++        while not entered.is_set() and time.time() - t0 < 3:
++            time.sleep(0.01)
++        assert entered.is_set(), "рабочий поток не стартовал"
++
++        # Вторая проверка не должна стартовать, пока первая идёт
++        bridge.kickoff_refresh(force=True)
++        time.sleep(0.2)
++        release.set()
++        assert _wait(app, lambda: bag.diag == 1)
++        assert calls["n"] == 1, "запустился второй параллельный пробег диагностики"
++
++    def test_no_torch_import_while_refreshing(self, app, fresh_bridge, monkeypatch):
++        """Регрессия access violation: ни один импорт torch/TTS в GUI-процессе
++        быть не должен — даже если диагностика сообщила, что torch жив."""
++        import builtins
++
++        real_import = builtins.__import__
++        forbidden = []
++
++        def guarded_import(name, *args, **kwargs):
++            root = name.split(".")[0]
++            if root in ("torch", "TTS", "torchvision", "torchaudio"):
++                forbidden.append(name)
++            return real_import(name, *args, **kwargs)
++
++        monkeypatch.setattr(fresh_bridge, "run_full_diagnostics",
++                            lambda force_refresh=False: {"torch": True,
++                                                         "cuda_available": False,
++                                                         "cuda_name": ""})
++        monkeypatch.setattr(builtins, "__import__", guarded_import)
++        bridge = fresh_bridge.get_bridge()
++        bag = _SignalBag(bridge)
++
++        bridge.kickoff_refresh(force=True)
++        assert _wait(app, lambda: bag.diag == 1)
++        assert forbidden == [], f"импорт нативных ML-модулей в GUI-процессе: {forbidden}"
++
++    def test_source_has_no_native_ml_imports(self, fresh_bridge):
++        import inspect
++        src = inspect.getsource(fresh_bridge)
++        assert "_probe_cuda_in_torch" not in src
++        for mod in ("torch", "TTS", "torchvision", "torchaudio", "llama_cpp"):
++            assert not re.search(rf"^\s*(import|from)\s+{mod}\b", src, re.M), \
++                f"diag_bridge не должен импортировать {mod} в GUI-процессе"
++
++
++class TestCachePredicates:
++    def test_predicates_read_cache_without_qt(self, fresh_bridge, monkeypatch):
++        monkeypatch.setattr(fresh_bridge, "load_diagnostics_cache",
++                            lambda: {"torch": True, "tts": True})
++        assert fresh_bridge.torch_available() is True
++        assert fresh_bridge.tts_available() is True
++        assert fresh_bridge.coqui_available() is True
++
++    def test_predicates_fail_safe(self, fresh_bridge, monkeypatch):
++        monkeypatch.setattr(fresh_bridge, "load_diagnostics_cache",
++                            lambda: {})
++        assert fresh_bridge.torch_available() is False
++        assert fresh_bridge.tts_available() is False
++        assert fresh_bridge.coqui_available() is False
++        # torch нет в кэше → diffusers даже не проверяется
++        assert fresh_bridge.diffusers_available() is False
++
++    def test_singleton_identity(self, fresh_bridge):
++        assert fresh_bridge.get_bridge() is fresh_bridge.get_bridge()
+diff --git a/test/test_diagnostics_cuda.py b/test/test_diagnostics_cuda.py
+new file mode 100644
+index 0000000..e782775
+--- /dev/null
++++ b/test/test_diagnostics_cuda.py
+@@ -0,0 +1,160 @@
++# -*- coding: utf-8 -*-
++"""CUDA-инфо в диагностике: собирается ТОЛЬКО в изолированном сабпроцессе
++(run_full_diagnostics), передаётся маркером CUDA_RESULT в stdout,
++складывается в отдельный блок кэша cache["cuda"] и доставляется
++вызывающим кодом как результаты cuda_available/cuda_name.
++
++Зачем: опрос torch.cuda.* в GUI-процессе — это import torch, а access
++violation на битом torch убивает процесс целиком (Windows, PySide6).
++"""
++from __future__ import annotations
++
++import json
++import sys
++import types
++
++import pytest
++
++
++def _ns_run(fn):
++    """Подмена модуля subprocess внутри diagnostics: только run(), неглобально."""
++    return types.SimpleNamespace(run=fn)
++
++from ai_studio_core.env_core import diagnostics
++
++_ALL_OK = {
++    "numpy": True, "torch": True, "torchaudio": True, "torchvision": True,
++    "tts": True, "soundfile": True, "pygame": True, "customtkinter": True,
++    "num2words": True, "cryptography": True, "llama_cpp": True,
++    "rvc_python": True,
++}
++
++
++@pytest.fixture()
++def diag_paths(tmp_path, monkeypatch):
++    """Изоляция: кэш, site-packages и лог-записи — в tmp."""
++    sp = tmp_path / "site-packages"
++    sp.mkdir()
++    monkeypatch.setattr(diagnostics, "DIAG_CACHE_PATH",
++                        str(tmp_path / ".env_diagnostics_cache.json"))
++    monkeypatch.setattr(diagnostics, "SITE_PACKAGES", str(sp))
++    monkeypatch.setattr(diagnostics, "PYTHON_EXE", sys.executable)
++    monkeypatch.setattr(diagnostics, "write_log", lambda *a, **k: None)
++    monkeypatch.setattr(diagnostics, "_clean_dataclasses_backport", lambda: 0)
++    return tmp_path
++
++
++def _fake_proc(results: dict, cuda: dict | None):
++    out = []
++    if cuda is not None:
++        out.append("CUDA_RESULT=" + json.dumps(cuda))
++    out.append("SUB_RESULT=" + json.dumps(results))
++
++    class _Proc:
++        stdout = "\n".join(out) + "\n"
++        stderr = ""
++    return _Proc()
++
++
++class TestCudaMarkerParsing:
++    def test_cuda_parsed_attached_and_cached(self, diag_paths, monkeypatch):
++        calls = {"n": 0}
++
++        def fake_run(cmd, capture_output, text, timeout, env):
++            calls["n"] += 1
++            assert cmd[0] == sys.executable and cmd[1] == "-c"
++            return _fake_proc(dict(_ALL_OK), {"available": True, "name": "NVIDIA RTX Fake"})
++
++        monkeypatch.setattr(diagnostics, "subprocess", _ns_run(fake_run))
++        res = diagnostics.run_full_diagnostics(force_refresh=True)
++
++        assert calls["n"] == 1
++        assert res["cuda_available"] is True
++        assert res["cuda_name"] == "NVIDIA RTX Fake"
++        # Компоненты не пострадали
++        assert res["torch"] is True and res["numpy"] is True
++
++        # В кэше CUDA лежит ОТДЕЛЬНЫМ блоком, а не внутри results
++        with open(diagnostics.DIAG_CACHE_PATH, "r", encoding="utf-8") as f:
++            cache = json.load(f)
++        assert cache["cuda"] == {"available": True, "name": "NVIDIA RTX Fake"}
++        assert "cuda_available" not in cache["results"]
++
++        # Второй вызов без force — читает кэш, сабпроцесс не запускается,
++        # но cuda-ключи присутствуют
++        res2 = diagnostics.run_full_diagnostics(force_refresh=False)
++        assert calls["n"] == 1
++        assert res2["cuda_available"] is True
++        assert res2["cuda_name"] == "NVIDIA RTX Fake"
++
++        # И load_diagnostics_cache отдаёт те же ключи
++        res3 = diagnostics.load_diagnostics_cache()
++        assert res3["cuda_available"] is True
++        assert res3["cuda_name"] == "NVIDIA RTX Fake"
++
++    def test_cache_without_cuda_block_gives_false(self, diag_paths, monkeypatch):
++        """Старый кэш (до появления CUDA-блока) — честные False, без ошибок."""
++        sp = diagnostics.SITE_PACKAGES
++        import os
++        cache_data = {
++            "python_exe": diagnostics.PYTHON_EXE,
++            "site_packages_mtime": os.path.getmtime(sp),
++            "site_packages_count": len(os.listdir(sp)),
++            "timestamp": 123.0,
++            "results": dict(_ALL_OK),
++        }
++        with open(diagnostics.DIAG_CACHE_PATH, "w", encoding="utf-8") as f:
++            json.dump(cache_data, f)
++
++        monkeypatch.setattr(diagnostics.subprocess, "run",
++                            lambda *a, **k: pytest.fail("сабпроцесс не должен запускаться"))
++        res = diagnostics.run_full_diagnostics(force_refresh=False)
++        assert res["cuda_available"] is False
++        assert res["cuda_name"] == ""
++
++    def test_cuda_requires_live_torch(self, diag_paths, monkeypatch):
++        """Флаг available из сабпроцесса игнорируется, если torch не жив."""
++        results = dict(_ALL_OK)
++        results["torch"] = "ImportError: DLL load failed"
++        monkeypatch.setattr(
++            diagnostics, "subprocess",
++            _ns_run(lambda *a, **k: _fake_proc(results, {"available": True, "name": "Lying"})))
++        res = diagnostics.run_full_diagnostics(force_refresh=True)
++        assert res["cuda_available"] is False
++        assert res["cuda_name"] == "Lying"  # имя транспортируем, флаг — нет
++
++    def test_missing_cuda_marker_gives_false(self, diag_paths, monkeypatch):
++        monkeypatch.setattr(
++            diagnostics, "subprocess",
++            _ns_run(lambda *a, **k: _fake_proc(dict(_ALL_OK), None)))
++        res = diagnostics.run_full_diagnostics(force_refresh=True)
++        assert res["cuda_available"] is False
++        assert res["cuda_name"] == ""
++
++
++class TestRealProbe:
++    def test_real_subprocess_probe_emits_cuda_marker(self, diag_paths):
++        """Реальный прогон сабпроцесса-пробы: маркер CUDA_RESULT разобран,
++        результат содержит cuda-ключи. В этой среде torch нет → False.
++        Скрытая проверка: GUI-процесс этот импорт torch сам НЕ делает."""
++        import builtins
++        real_import = builtins.__import__
++        forbidden = []
++
++        def guarded_import(name, *args, **kwargs):
++            if name.split(".")[0] in ("torch", "TTS"):
++                forbidden.append(name)
++            return real_import(name, *args, **kwargs)
++
++        saved = builtins.__import__
++        builtins.__import__ = guarded_import
++        try:
++            res = diagnostics.run_full_diagnostics(force_refresh=True)
++        finally:
++            builtins.__import__ = saved
++
++        assert forbidden == [], f"нативный ML-импорт в GUI-процессе: {forbidden}"
++        assert "numpy" in res and "cuda_available" in res
++        assert res["numpy"] is True                      # numpy в среде есть
++        assert res["cuda_available"] is False            # torch в среде нет
++        assert res["cuda_name"] == ""
+-- 
+2.47.3
+

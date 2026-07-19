@@ -1,0 +1,1368 @@
+commit 05ffe8795e3ac0b1f3856f96a3b5fffd6c2d4c75
+Author: arena-agent <agent@local>
+Date:   Sun Jul 19 01:15:02 2026 +0000
+
+    Stage 12 — experience layer: event presets (toast/sound/accent pulse), real synthesized tones, usage stats, adaptive start tab
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..4e7704a
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,7 @@
++# Runtime-артефакты (не коммитим)
++ai_studio_core/outputs/
++ai_studio_core/cache/
++ai_studio_core/json/usage_stats.json
++ai_studio_core/json/history.json
++__pycache__/
++*.pyc
+diff --git a/AUDIT_12_experience.md b/AUDIT_12_experience.md
+new file mode 100644
+index 0000000..da80e4b
+--- /dev/null
++++ b/AUDIT_12_experience.md
+@@ -0,0 +1,73 @@
++# Отчёт №12 — Experience layer: события/звуки/акцент (ур. 1) + статистика (ур. 2)
++
++**Дата:** 2026-07-19
++**Этап:** Поверх готовой архитектуры добавлен слой микро-обратной связи —
++без ИИ, без скрытых изменений, с реальными артефактами. Объём согласован:
++уровни 1+2; уровень 3 (AI UX Agent) осознанно отложен — только советник
++с явным consent, отдельным этапом.
++
++---
++
++## 1. Что добавлено
++
++### Уровень 1 — события → пресеты действий
++
++| Компонент | Суть |
++|---|---|
++| `ui/experience/events.py` | Реестр из 10 событий (app_started, generation_complete/failed, queue_drained, project saved/loaded/new, download_finished, export_done, chat_reply). Опечатка в пресете → `ValueError` при загрузке, не молчание. |
++| `ui/theme/presets/experience.default.json` | Mapping событие → `{toast, sound, accent_pulse}`. Toast только там, где приложение ещё не показывает свой (дедупликация). Toast-тексты: i18n-ключ или литерал с `{output}`-плейсхолдерами (безопасный format_map, без KeyError). |
++| `ui/experience/sounds.py` | **Реальные** тона: numpy-синтез нотных последовательностей (start_soft, done_chime, error_low, success_soft, tick) в WAV 22050 Гц 16-bit mono с attack/release-огибающей; кэш `CACHE_DIR/experience/`. Никаких бинарных подделок. |
++| `ui/experience/manager.py` | `ExperienceManager.handle(event, payload)` → toast/звук/пульс по пресету. Звук — `QSoundEffect`, guarded (без аудио-устройства тихо, статус в лог). Тумблер звуков отключает **только** звук (пульс/toast живут отдельно). |
++| `AccentPulse` | Полоса 5 px поверх окна: вспышка → `QPropertyAnimation`-затухание → авто-скрытие. Никакого «перекрасили и забыли». |
++
++### Уровень 2 — статистика → честная эвристика
++
++| Компонент | Суть |
++|---|---|
++| `ui/experience/stats.py::UsageStats` | Счётчики из реальных событий: сессии, активации вкладок, действия (tts_generate/chat_send/export/download/project_save/…), использование бэкендов, активные секунды. Атомарный `json/usage_stats.json`. Неизвестные поля при загрузке игнорируются явно. |
++| `suggested_start_workspace` | Детерминированная эвристика: ≥3 активаций → вкладка-максимум; ничья → дефолт tts; недостаточно данных → дефолт. Причина возвращается с решением и пишется в консоль (`exp_start_tab_reason`). |
++| Проводка | Активации вкладок пишутся **только** при пользовательских переключениях (программный выбор эвристикой не засчитывается — данные не насилуются). Длительность сессии записывается в `closeEvent`. |
++| Тумблеры | Settings → General: «Звуковые эффекты интерфейса» (`ui/exp_sounds`) и «Адаптивная стартовая вкладка» (`ui/adaptive_start_tab`) — обе в снапшоте `settings_changed`, обе персистятся. |
++
++### Правило consent (заложено под уровень 3)
++
++Transient-эффекты — без спроса; персистентное поведение — только через
++явные опции пользователя. Ни одно событие не меняет интерфейс молча.
++
++## 2. Тесты (новые, 22 шт., `test_experience_layer.py`)
++
++- **Звуки:** каждый тон — реальный WAV (rate/channels/16-bit, размер,
++  RMS анти-тишина, длительность = сумме нот ±1%); кэш не пересинтезирует
++  (mtime стабилен); неизвестный тон — ValueError.
++- **Пресеты:** дефолт валиден; неизвестное событие/действие/тон →
++  точная ошибка; merge пользовательского пресета поверх базового.
++- **Менеджер:** событие исполняет действия пресета; отключение звуков
++  глушит play, но не пульс; resolve_text (i18n-ключ/литерал/безопасные
++  плейсхолдеры); неизвестное событие → честный False, колбэки пусты.
++- **AccentPulse:** показывается и **самоудаляется** за ~1 с (offscreen).
++- **Статистика:** запись→диск→чтение roundtrip; отсутствующий файл — пусто
++  без краша; мусорные поля отброшены; эвристика (threshold/winner/tie).
++- **Интеграция (MainWindow):** seed chat×6+tts×1 → стартовая вкладка «Чат»;
++  тумблер off → дефолт; без статистики → дефолт; тумблер звуков доезжает
++  до менеджера и QSettings; переключение вкладки → активация на диске;
++  queue_drained стреляет ровно один раз.
++
++## 3. Проверки
++
++- Полный прогон: **642 passed** (620 + 22), lint-imports — **KEPT**.
++- Скриншот `ui_experience_pulse.png`: стартовая вкладка «Чат» выбрана
++  эвристикой из seed-статистики; в консоли реальный сгенерированный WAV;
++  пульс программно подтверждён видимым в полёте и скрытым через 1.2 с;
++  в кэше лежат три реально синтезированных тона
++  (`start_soft/done_chime/success_soft`).
++
++## 4. Осознанные границы
++
++- Скрин-глазам 5 px пульс на 1440-окне малозаметен — программные ассерты
++  (`pulse visible → hidden`) фиксируют поведение; толщину/цвет меняет
++  пресет, не код.
++- Оффлайн-окружение без аудио-устройства: звук реально синтезируется в файл
++  (проверено побайтно), проигрывание — guarded no-op. На десктопе с
++  аудио-выходом тот же путь звучит.
++- «Пользовательские пресеты» читаются `merge_presets(base, path)` — UI-выбор
++  пресета в Settings не добавлялся (уровень 1 задуман инфраструктурным).
+diff --git a/DOCUMENTATION.md b/DOCUMENTATION.md
+index 6221600..55756d9 100644
+--- a/DOCUMENTATION.md
++++ b/DOCUMENTATION.md
+@@ -747,5 +747,39 @@ MainWindow: save_project_to(path); load_project_from(path); retranslate_ui()
+ 
+ ---
+ 
+-*Документация отражает код на 2026-07-19 (этапы 06–11). При изменении
++## 17. Experience layer (этап 12)
++
++**`ui/experience/`** — событийный слой микро-обратной связи и статистики.
++Отделён от ядра: подписывается на сигналы контроллеров и колбэки окна,
++не нарушая контракт слоёв. Правило безопасности: transient-эффекты
++(toast/звук/пульс) — без спроса; персистентные изменения — только через
++явные тумблеры в Settings.
++
++- **Уровень 1 (события → пресеты).** `events.py` — реестр имён событий
++  (валидируется при загрузке пресета). `theme/presets/experience.default.json`
++  — mapping событие → `{toast, sound, accent_pulse}`; toast-тексты через
++  i18n-ключи или литералы с `{payload}`-плейсхолдерами. `sounds.py` —
++  **реальные** тона: numpy-синтез (огибающая attack/release) в WAV
++  22050 Гц, кэш в `CACHE_DIR/experience/`; воспроизведение через
++  `QSoundEffect` (guarded — без аудио-устройства тихо). `manager.py` —
++  `ExperienceManager.handle(event, payload)` + `AccentPulse` (полоса 5 px
++  с анимацией затухания, самоудаляется).
++- **Уровень 2 (статистика → эвристики).** `stats.py::UsageStats` —
++  атомарный `json/usage_stats.json`: сессии, активации вкладок, действия,
++  использование бэкендов, активные секунды. Эвристика
++  `suggested_start_workspace` — детерминированная: максимум активаций при
++  ≥3 событиях, ничья → дефолт; причина решения возвращается и пишется в лог.
++  Отключение — Settings → «Адаптивная стартовая вкладка» (QSettings
++  `ui/adaptive_start_tab`); звуки — `ui/exp_sounds`.
++- События-проводка в `MainWindow`: generation complete/failed, queue
++  drained (had_running→0), project saved/loaded/new, download finished,
++  export done, chat reply, app started; активации вкладок и длительность
++  сессии записываются (программный выбор вкладки эвристикой не засчитывается).
++- Тесты (`test_experience_layer.py`, 22): реальные WAV (частота/формат/
++  анти-тишина), кэш, валидация и merge пресетов, исполнение действий
++  менеджера, отключение звука, авто-скрытие пульса, roundtrip статистики,
++  эвристика (threshold/winner/tie), интеграция с MainWindow (адаптивная
++  вкладка, тумблеры, запись активаций, queue_drained один раз).
++
++*Документация отражает код на 2026-07-19 (этапы 06–12). При изменении
+ поведения обновляйте соответствующие разделы и аудит этапа.*
+diff --git a/ai_studio_core/ai_studio_core/i18n.py b/ai_studio_core/ai_studio_core/i18n.py
+index 228f4c6..93c9da2 100644
+--- a/ai_studio_core/ai_studio_core/i18n.py
++++ b/ai_studio_core/ai_studio_core/i18n.py
+@@ -208,6 +208,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "set_theme": "Theme:",
+         "set_language": "Language:",
+         "set_autosave": "Auto-save projects",
++        "exp_sounds": "Interface sound effects",
++        "exp_adaptive_tab": "Adaptive start tab (from usage stats)",
++        "exp_queue_drained": "All queued tasks finished",
++        "exp_start_tab_reason": "Start tab by usage stats:",
+         "set_performance": "Performance",
+         "set_device": "Device:",
+         "set_threads": "Worker threads:",
+@@ -413,6 +417,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "set_theme": "Тема:",
+         "set_language": "Язык:",
+         "set_autosave": "Автосохранение проектов",
++        "exp_sounds": "Звуковые эффекты интерфейса",
++        "exp_adaptive_tab": "Адаптивная стартовая вкладка (по статистике)",
++        "exp_queue_drained": "Все задачи очереди завершены",
++        "exp_start_tab_reason": "Стартовая вкладка выбрана по статистике:",
+         "set_performance": "Производительность",
+         "set_device": "Устройство:",
+         "set_threads": "Потоки воркеров:",
+diff --git a/ai_studio_core/ai_studio_core/ui/experience/__init__.py b/ai_studio_core/ai_studio_core/ui/experience/__init__.py
+new file mode 100644
+index 0000000..18f8fb7
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/experience/__init__.py
+@@ -0,0 +1,31 @@
++"""Experience layer — событийный слой микро-обратной связи и статистики.
++
++Уровень 1: события → пресеты действий (toast / звук / акцентный пульс).
++Уровень 2: статистика использования → честные эвристики (стартовая вкладка).
++
++Отделён от ядра: знает только про сигналы контроллеров и колбэки окна.
++Никаких скрытых персистентных изменений — transient-эффекты без спроса,
++персистентные предпочтения только через явные настройки пользователя.
++"""
++from .events import (
++    ALL_EVENTS,
++    APP_STARTED,
++    CHAT_REPLY,
++    DOWNLOAD_FINISHED,
++    EXPORT_DONE,
++    GENERATION_COMPLETE,
++    GENERATION_FAILED,
++    PROJECT_LOADED,
++    PROJECT_NEW,
++    PROJECT_SAVED,
++    QUEUE_DRAINED,
++)
++from .manager import AccentPulse, ExperienceManager
++from .stats import UsageStats, suggested_start_workspace
++
++__all__ = [
++    "ALL_EVENTS", "APP_STARTED", "CHAT_REPLY", "DOWNLOAD_FINISHED", "EXPORT_DONE",
++    "GENERATION_COMPLETE", "GENERATION_FAILED", "PROJECT_LOADED", "PROJECT_NEW",
++    "PROJECT_SAVED", "QUEUE_DRAINED",
++    "AccentPulse", "ExperienceManager", "UsageStats", "suggested_start_workspace",
++]
+diff --git a/ai_studio_core/ai_studio_core/ui/experience/events.py b/ai_studio_core/ai_studio_core/ui/experience/events.py
+new file mode 100644
+index 0000000..f763bfd
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/experience/events.py
+@@ -0,0 +1,28 @@
++"""Каталог событий experience-слоя (уровень 1).
++
++Событие — это факт, который УЖЕ произошёл в приложении (сигнал контроллера
++или успешное действие окна). Новые события добавляются только сюда:
++пресеты и менеджер валидируют имена по ALL_EVENTS — опечатка в пресете
++выявляется при загрузке, а не молча игнорируется.
++"""
++from __future__ import annotations
++
++APP_STARTED = "app_started"
++GENERATION_COMPLETE = "generation_complete"
++GENERATION_FAILED = "generation_failed"
++QUEUE_DRAINED = "queue_drained"
++PROJECT_SAVED = "project_saved"
++PROJECT_LOADED = "project_loaded"
++PROJECT_NEW = "project_new"
++DOWNLOAD_FINISHED = "download_finished"
++EXPORT_DONE = "export_done"
++CHAT_REPLY = "chat_reply"
++
++ALL_EVENTS = frozenset({
++    APP_STARTED, GENERATION_COMPLETE, GENERATION_FAILED, QUEUE_DRAINED,
++    PROJECT_SAVED, PROJECT_LOADED, PROJECT_NEW, DOWNLOAD_FINISHED,
++    EXPORT_DONE, CHAT_REPLY,
++})
++
++# Известные действия пресетов (уровень 1): валидация схемы пресета.
++ALL_ACTIONS = frozenset({"toast", "sound", "accent_pulse"})
+diff --git a/ai_studio_core/ai_studio_core/ui/experience/manager.py b/ai_studio_core/ai_studio_core/ui/experience/manager.py
+new file mode 100644
+index 0000000..2dab651
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/experience/manager.py
+@@ -0,0 +1,153 @@
++"""ExperienceManager — исполнитель пресетов поверх событий приложения.
++
++Принцип «честных состояний»: менеджер делает только transient-эффекты
++(toast, звук, акцентный пульс с авто-затуханием). Никаких персистентных
++изменений интерфейса без явного действия пользователя.
++
++Звук — через QSoundEffect, guarded: без аудио-устройства тихо и без ошибок.
++"""
++from __future__ import annotations
++
++from PySide6.QtCore import QObject, QUrl
++from PySide6.QtGui import QColor
++from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
++
++from ai_studio_core.i18n import t as tr
++
++from . import sounds
++
++try:  # мультимедиа может отсутствовать в headless-сборке Qt
++    from PySide6.QtMultimedia import QSoundEffect
++except Exception:  # pragma: no cover
++    QSoundEffect = None
++
++
++class _SafeFormat(dict):
++    """format_map: отсутствующие плейсхолдеры остаются как есть, без KeyError."""
++
++    def __missing__(self, key):
++        return "{" + key + "}"
++
++
++def resolve_text(template: str, payload: dict | None = None) -> str:
++    """Текст toast'а: i18n-ключ, если такой есть, иначе литерал + {payload}."""
++    translated = tr(template)
++    text = translated if translated != template else template
++    try:
++        return text.format_map(_SafeFormat(payload or {}))
++    except (ValueError, IndexError):
++        return text
++
++
++class AccentPulse(QWidget):
++    """Тонкая цветная полоса поверх окна: вспышка → затухание → скрытие.
++
++    Самоудаляется — никакого «перекрасили и забыли».
++    """
++
++    def __init__(self, parent: QWidget):
++        super().__init__(parent)
++        from PySide6.QtCore import QPropertyAnimation
++        from PySide6.QtGui import QPalette
++        self._palette_role = QPalette.ColorRole.Window
++        self.setFixedHeight(5)
++        self.setAutoFillBackground(True)
++        self.hide()
++        self._eff = QGraphicsOpacityEffect(self)
++        self._eff.setOpacity(0.0)
++        self.setGraphicsEffect(self._eff)
++        self._anim = QPropertyAnimation(self._eff, b"opacity", self)
++        self._anim.finished.connect(self._on_anim_finished)
++
++    def pulse(self, color: str, duration_ms: int = 800) -> None:
++        parent = self.parentWidget()
++        if parent is None:
++            return
++        from PySide6.QtGui import QPalette
++        self.setGeometry(0, 0, parent.width(), 5)
++        pal = self.palette()
++        pal.setColor(self._palette_role, QColor(color))
++        self.setPalette(pal)
++        self._anim.stop()
++        self._eff.setOpacity(0.85)
++        self.show()
++        self.raise_()
++        self._anim.setStartValue(0.85)
++        self._anim.setEndValue(0.0)
++        self._anim.setDuration(max(100, int(duration_ms)))
++        self._anim.start()
++
++    def _on_anim_finished(self) -> None:
++        if self._anim.endValue() == 0.0:
++            self.hide()
++
++
++class ExperienceManager(QObject):
++    """Подписывается на события → исполняет действия пресета."""
++
++    def __init__(self, toast_cb=None, pulse_cb=None, status_cb=None,
++                 parent: QObject | None = None):
++        super().__init__(parent)
++        self._toast_cb = toast_cb
++        self._pulse_cb = pulse_cb
++        self._status_cb = status_cb
++        self._mapping: dict[str, dict] = {}
++        self._sounds_enabled = True
++        self._player = None
++
++    # ── конфигурация ──
++
++    def configure(self, mapping: dict) -> None:
++        self._mapping = {e: dict(a) for e, a in (mapping or {}).items()}
++
++    def mapping(self) -> dict:
++        return {e: dict(a) for e, a in self._mapping.items()}
++
++    def set_sounds_enabled(self, enabled: bool) -> None:
++        self._sounds_enabled = bool(enabled)
++
++    def sounds_enabled(self) -> bool:
++        return self._sounds_enabled
++
++    # ── главная точка входа ──
++
++    def handle(self, event: str, payload: dict | None = None) -> bool:
++        """Обработать событие. False — событие неизвестно/без действий."""
++        actions = self._mapping.get(event)
++        if not actions:
++            return False
++
++        toast = actions.get("toast")
++        if toast and self._toast_cb:
++            self._toast_cb(resolve_text(toast["text"], payload),
++                           toast.get("variant", "info"))
++
++        sound = actions.get("sound")
++        if sound and self._sounds_enabled:
++            self._play(sound)
++
++        pulse = actions.get("accent_pulse")
++        if pulse and self._pulse_cb:
++            self._pulse_cb(pulse["color"], pulse.get("duration_ms", 800))
++        return True
++
++    # ── звук ──
++
++    def _play(self, tone_name: str) -> None:
++        if QSoundEffect is None:
++            return
++        try:
++            path = sounds.tone_path(tone_name)
++        except Exception as e:
++            if self._status_cb:
++                self._status_cb(f"tone synth failed: {e}")
++            return
++        try:
++            if self._player is None:
++                self._player = QSoundEffect(self)
++                self._player.setVolume(0.55)
++            self._player.setSource(QUrl.fromLocalFile(path))
++            self._player.play()
++        except Exception as e:  # нет аудио-устройства — тихо и честно
++            if self._status_cb:
++                self._status_cb(f"audio playback unavailable: {e}")
+diff --git a/ai_studio_core/ai_studio_core/ui/experience/presets.py b/ai_studio_core/ai_studio_core/ui/experience/presets.py
+new file mode 100644
+index 0000000..629b0fc
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/experience/presets.py
+@@ -0,0 +1,95 @@
++"""Пресеты experience-слоя: событие → действия (toast/звук/акцент).
++
++Формат JSON:
++{
++  "name": "default",
++  "events": {
++    "generation_complete": {
++      "toast": {"variant": "success", "text": "exp_msg_or_literal {output}"},
++      "sound": "done_chime",
++      "accent_pulse": {"color": "#10b981", "duration_ms": 900}
++    }
++  }
++}
++
++Валидация при загрузке: неизвестное событие/действие/звук/вариант →
++ValueError с указанием места (не молчим и не «угадываем»).
++"""
++from __future__ import annotations
++
++import json
++import os
++
++from .events import ALL_ACTIONS, ALL_EVENTS
++from .sounds import available_tones
++
++DEFAULT_PRESET_PATH = os.path.join(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++    "theme", "presets", "experience.default.json",
++)
++
++_TOAST_VARIANTS = {"info", "success", "warning", "error"}
++
++
++def validate_preset(data: dict) -> dict:
++    """Нормализует и проверяет пресет. Возвращает mapping event→actions."""
++    if not isinstance(data, dict):
++        raise ValueError("preset root must be an object")
++    events = data.get("events")
++    if not isinstance(events, dict):
++        raise ValueError("preset must contain 'events' object")
++
++    tones = set(available_tones())
++    mapping: dict[str, dict] = {}
++    for event, actions in events.items():
++        if event not in ALL_EVENTS:
++            raise ValueError(f"unknown event in preset: {event!r}")
++        if not isinstance(actions, dict):
++            raise ValueError(f"actions of {event!r} must be an object")
++        unknown = set(actions) - ALL_ACTIONS
++        if unknown:
++            raise ValueError(f"unknown actions for {event!r}: {sorted(unknown)}")
++
++        norm: dict = {}
++        toast = actions.get("toast")
++        if toast is not None:
++            if not isinstance(toast, dict) or not toast.get("text"):
++                raise ValueError(f"toast of {event!r} needs 'text'")
++            variant = toast.get("variant", "info")
++            if variant not in _TOAST_VARIANTS:
++                raise ValueError(f"bad toast variant for {event!r}: {variant!r}")
++            norm["toast"] = {"variant": variant, "text": str(toast["text"])}
++
++        sound = actions.get("sound")
++        if sound is not None:
++            if sound not in tones:
++                raise ValueError(f"unknown tone for {event!r}: {sound!r}")
++            norm["sound"] = sound
++
++        pulse = actions.get("accent_pulse")
++        if pulse is not None:
++            if not isinstance(pulse, dict) or not pulse.get("color"):
++                raise ValueError(f"accent_pulse of {event!r} needs 'color'")
++            norm["accent_pulse"] = {
++                "color": str(pulse["color"]),
++                "duration_ms": int(pulse.get("duration_ms", 800)),
++            }
++        if norm:
++            mapping[event] = norm
++    return mapping
++
++
++def load_preset(path: str | None = None) -> dict:
++    """Загружает пресет с диска → mapping event→actions (валидированный)."""
++    path = path or DEFAULT_PRESET_PATH
++    with open(path, "r", encoding="utf-8") as f:
++        data = json.load(f)
++    return validate_preset(data)
++
++
++def merge_presets(base: dict, override_path: str) -> dict:
++    """Пользовательский пресет поверх базового (по событиям)."""
++    override = load_preset(override_path)
++    merged = {k: dict(v) for k, v in base.items()}
++    merged.update(override)
++    return merged
+diff --git a/ai_studio_core/ai_studio_core/ui/experience/sounds.py b/ai_studio_core/ai_studio_core/ui/experience/sounds.py
+new file mode 100644
+index 0000000..f104c6e
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/experience/sounds.py
+@@ -0,0 +1,76 @@
++"""Реальные звуковые тона experience-слоя.
++
++Никаких бинарных заглушек: каждый тон синтезируется numpy'ом в настоящий
++WAV (22050 Гц, mono, 16-bit PCM) с огибающей attack/release, кэшируется в
++CACHE_DIR/experience/. Детерминировано — одинаковый вход, одинаковый файл.
++"""
++from __future__ import annotations
++
++import os
++import wave
++
++import numpy as np
++
++SAMPLE_RATE = 22050
++_AMPLITUDE = 0.32
++_ENVELOPE_SEC = 0.012
++
++# Ноты = (частота Гц, длительность с). Названия регистрируются здесь —
++# пресет со звуком вне списка отклоняется валидатором.
++TONES: dict[str, list[tuple[float, float]]] = {
++    # G4→C5: мягкий старт приложения
++    "start_soft": [(392.00, 0.090), (523.25, 0.120)],
++    # C5→E5→G5: арпеджио завершения генерации
++    "done_chime": [(523.25, 0.070), (659.25, 0.070), (783.99, 0.150)],
++    # A3→F3: нисходящий сигнал ошибки
++    "error_low": [(220.00, 0.150), (174.61, 0.210)],
++    # E5→A5: мягкое «всё готово»
++    "success_soft": [(659.25, 0.090), (880.00, 0.130)],
++    # короткий тик для мелких успехов (экспорт, ответ чата)
++    "tick": [(880.00, 0.045)],
++}
++
++
++def available_tones() -> list[str]:
++    return sorted(TONES)
++
++
++def tone_wav(name: str) -> np.ndarray:
++    """Синтезирует тон → float32-массив сэмплов в диапазоне [-1, 1]."""
++    if name not in TONES:
++        raise ValueError(f"unknown tone: {name!r}")
++    parts = []
++    env_n = max(1, int(_ENVELOPE_SEC * SAMPLE_RATE))
++    for freq, dur in TONES[name]:
++        n = int(SAMPLE_RATE * dur)
++        t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
++        wave_ = np.sin(2.0 * np.pi * freq * t)
++        env = np.ones(n, dtype=np.float32)
++        k = min(env_n, n // 2)
++        env[:k] = np.linspace(0.0, 1.0, k)
++        env[-k:] = np.linspace(1.0, 0.0, k)
++        parts.append(wave_ * env)
++    return (np.concatenate(parts) * _AMPLITUDE).astype(np.float32)
++
++
++def _write_wav(path: str, samples: np.ndarray) -> None:
++    pcm = np.clip(samples, -1.0, 1.0)
++    pcm16 = (pcm * 32767.0).astype("<i2")
++    with wave.open(path, "wb") as wf:
++        wf.setnchannels(1)
++        wf.setsampwidth(2)
++        wf.setframerate(SAMPLE_RATE)
++        wf.writeframes(pcm16.tobytes())
++
++
++def tone_path(name: str, cache_dir: str | None = None) -> str:
++    """Путь к WAV-файлу тона (ленивая синтезация + кэш на диске)."""
++    if cache_dir is None:
++        from ai_studio_core.paths import CACHE_DIR
++        cache_dir = CACHE_DIR
++    out_dir = os.path.join(cache_dir, "experience")
++    os.makedirs(out_dir, exist_ok=True)
++    path = os.path.join(out_dir, f"{name}.wav")
++    if not os.path.isfile(path):
++        _write_wav(path, tone_wav(name))
++    return path
+diff --git a/ai_studio_core/ai_studio_core/ui/experience/stats.py b/ai_studio_core/ai_studio_core/ui/experience/stats.py
+new file mode 100644
+index 0000000..39fb3ce
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/experience/stats.py
+@@ -0,0 +1,112 @@
++"""Статистика использования (уровень 2) — честная аналитика без ИИ.
++
++Счётчики только из реальных событий приложения; персистентность —
++атомарный JSON (`json/usage_stats.json`, monkeypatch'ится `STATS_PATH`).
++Эвристики — детерминированные и объяснимые: причина решения всегда
++возвращается вместе с ним и озвучивается в лог.
++"""
++from __future__ import annotations
++
++import os
++
++from ai_studio_core.atomic_write import atomic_write_json
++from ai_studio_core.paths import JSON_DIR
++
++STATS_PATH = os.path.join(JSON_DIR, "usage_stats.json")
++
++WORKSPACES = ("tts", "chat", "image", "pipeline")
++MIN_ACTIVATIONS_FOR_HEURISTIC = 3
++
++
++class UsageStats:
++    """Счётчики сессий/активаций/действий. Никакой телеметрии — локальный JSON."""
++
++    def __init__(self, data: dict | None = None, path: str | None = None):
++        self._path = path or STATS_PATH
++        base = {
++            "version": 1,
++            "sessions": 0,
++            "session_seconds_total": 0.0,
++            "workspace_activations": {w: 0 for w in WORKSPACES},
++            "actions": {},
++            "backend_use": {},
++        }
++        if isinstance(data, dict):
++            for key, value in data.items():
++                if key == "workspace_activations" and isinstance(value, dict):
++                    base[key].update({k: int(v) for k, v in value.items()
++                                      if k in base[key]})
++                elif key in base and isinstance(value, type(base[key])):
++                    base[key] = value
++        self._d = base
++
++    # ── запись фактов ──
++
++    def record_session(self) -> None:
++        self._d["sessions"] += 1
++
++    def record_active_seconds(self, seconds: float) -> None:
++        try:
++            self._d["session_seconds_total"] += max(0.0, float(seconds))
++        except (TypeError, ValueError):
++            pass
++
++    def record_activation(self, workspace_id: str) -> None:
++        if workspace_id in self._d["workspace_activations"]:
++            self._d["workspace_activations"][workspace_id] += 1
++
++    def record_action(self, action: str) -> None:
++        acts = self._d["actions"]
++        acts[action] = int(acts.get(action, 0)) + 1
++
++    def record_backend(self, backend: str) -> None:
++        if backend:
++            bu = self._d["backend_use"]
++            bu[backend] = int(bu.get(backend, 0)) + 1
++            self._d["last_backend"] = backend
++
++    # ── чтение ──
++
++    def data(self) -> dict:
++        import copy
++        return copy.deepcopy(self._d)
++
++    def activations(self) -> dict:
++        return dict(self._d["workspace_activations"])
++
++    # ── персистентность ──
++
++    @classmethod
++    def load(cls, path: str | None = None) -> "UsageStats":
++        import json
++        path = path or STATS_PATH
++        try:
++            with open(path, "r", encoding="utf-8") as f:
++                data = json.load(f)
++        except Exception:
++            data = None
++        return cls(data, path=path)
++
++    def save(self, path: str | None = None) -> None:
++        atomic_write_json(path or self._path, self._d)
++
++
++def suggested_start_workspace(stats: UsageStats, default: str = "tts",
++                              min_activations: int = MIN_ACTIVATIONS_FOR_HEURISTIC
++                              ) -> tuple[str, str]:
++    """Эвристика стартовой вкладки: максимум активаций побеждает.
++
++    Возвращает (workspace_id, причина). Причину честно показываем в логе —
++    правило прозрачно: счётчики пользователя, не «ИИ решил».
++    """
++    acts = stats.activations()
++    total = sum(acts.values())
++    if total < min_activations:
++        return default, f"недостаточно данных ({total}/{min_activations})"
++    best = max(acts.items(), key=lambda kv: kv[1])
++    if acts.get(default, 0) == best[1]:
++        # ничья — честный дефолт
++        return default, f"ничья ({best[1]} активаций), дефолт {default}"
++    if best[1] == total:
++        return best[0], f"единственная используемая ({best[1]}/{total})"
++    return best[0], f"{best[1]}/{total} активаций — чаще всего"
+diff --git a/ai_studio_core/ai_studio_core/ui/main_window.py b/ai_studio_core/ai_studio_core/ui/main_window.py
+index f777ac8..41a91a4 100644
+--- a/ai_studio_core/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ai_studio_core/ui/main_window.py
+@@ -80,12 +80,16 @@ class MainWindow(QMainWindow):
+         self._setup_workspaces()
+         self._setup_dock_panels()
+         self._setup_status_bar()
++        self._setup_experience()
+         self._wire_controllers()
+         self._wire_settings()
+         self._restore_layout()
+ 
+         from PySide6.QtCore import QTimer
+-        QTimer.singleShot(300, lambda: self._toast(tr("msg_welcome"), "info"))
++        QTimer.singleShot(300, lambda: (
++            self._toast(tr("msg_welcome"), "info"),
++            self._xp.handle(self._xp_events.APP_STARTED),
++        ))
+ 
+     # ── Menu ──
+     def _setup_menu_bar(self) -> None:
+@@ -215,11 +219,105 @@ class MainWindow(QMainWindow):
+         self.setStatusBar(self._resource_bar)
+         self._resource_bar.set_message(tr("msg_ready"))
+ 
++    # ── Experience layer (уровни 1–2) ──
++    _EXP_SOUNDS_KEY = "ui/exp_sounds"
++    _EXP_ADAPTIVE_KEY = "ui/adaptive_start_tab"
++
++    @staticmethod
++    def _qs_bool(value) -> bool:
++        if isinstance(value, bool):
++            return value
++        return str(value).lower() not in ("false", "0", "none", "")
++
++    def _setup_experience(self) -> None:
++        from .experience import events as xp_events
++        from .experience import presets as xp_presets
++        from .experience import stats as xp_stats
++        from .experience.manager import ExperienceManager
++
++        self._xp_events = xp_events
++        self._xp_stats_mod = xp_stats
++        self._pulse_bar = None
++        self._had_running = False
++        self._suppress_activation_rec = False
++
++        self._xp = ExperienceManager(
++            toast_cb=lambda text, variant: self._toast(text, variant),
++            pulse_cb=self._pulse_accent,
++            status_cb=lambda msg: self._log_widget.append("WARN", msg),
++            parent=self,
++        )
++        try:
++            self._xp.configure(xp_presets.load_preset())
++        except Exception as e:
++            self._log_widget.append("WARN", f"experience preset invalid: {e}")
++        self._xp.set_sounds_enabled(
++            self._qs_bool(self._settings.value(self._EXP_SOUNDS_KEY, True)))
++
++        # Уровень 2: статистика + адаптивная стартовая вкладка
++        import time
++        self._session_t0 = time.time()
++        self._usage = xp_stats.UsageStats.load()
++        self._usage.record_session()
++        self._usage.save()
++        if self._qs_bool(self._settings.value(self._EXP_ADAPTIVE_KEY, True)):
++            ws, reason = xp_stats.suggested_start_workspace(self._usage)
++            idx = self._tab_index_for(ws)
++            if idx is not None:
++                self._suppress_activation_rec = True
++                self._workspace_tabs.setCurrentIndex(idx)
++                self._suppress_activation_rec = False
++            self._log_widget.append(
++                "INFO", f'{tr("exp_start_tab_reason")} {ws} ({reason})')
++
++    def _tab_index_for(self, workspace_id: str) -> int | None:
++        want = f"tab_{workspace_id}"
++        for idx, key in self._tab_map:
++            if key == want:
++                return idx
++        return None
++
++    def _pulse_accent(self, color: str, duration_ms: int) -> None:
++        from .experience.manager import AccentPulse
++        if self._pulse_bar is None:
++            self._pulse_bar = AccentPulse(self)
++        self._pulse_bar.pulse(color, duration_ms)
++
++    def _record_action(self, action: str) -> None:
++        try:
++            self._usage.record_action(action)
++            self._usage.save()
++        except Exception:
++            pass
++
++    def _on_tab_activated(self, idx: int) -> None:
++        if self._suppress_activation_rec:
++            return
++        for tab_idx, key in self._tab_map:
++            if tab_idx == idx:
++                try:
++                    self._usage.record_activation(key.removeprefix("tab_"))
++                    self._usage.save()
++                except Exception:
++                    pass
++                return
++
++    def _xp_queue_watch(self, tasks: list) -> None:
++        running = sum(1 for t in tasks if getattr(t, "status", "") == "running")
++        if self._had_running and running == 0:
++            self._xp.handle(self._xp_events.QUEUE_DRAINED)
++        self._had_running = running > 0
++
+     # ── Settings → language/theme/paths ──
+     def _wire_settings(self) -> None:
+         sp = self._settings_widget
+         # Комбоксокс показывает текущий язык (без эмиссии)
+         sp.set_language(i18n.get_language())
++        # Тумблеры experience — из QSettings (без эмиссии)
++        sp.set_exp_options(
++            self._qs_bool(self._settings.value(self._EXP_SOUNDS_KEY, True)),
++            self._qs_bool(self._settings.value(self._EXP_ADAPTIVE_KEY, True)),
++        )
+         sp.language_changed.connect(self._on_language_changed)
+         sp.settings_changed.connect(self._on_settings_changed)
+         sp.paths_changed.connect(self._on_paths_changed)
+@@ -239,6 +337,12 @@ class MainWindow(QMainWindow):
+ 
+     def _on_settings_changed(self, settings: dict) -> None:
+         self._app_settings = settings
++        if "exp_sounds" in settings:
++            self._xp.set_sounds_enabled(bool(settings["exp_sounds"]))
++            self._settings.setValue(self._EXP_SOUNDS_KEY, bool(settings["exp_sounds"]))
++        if "exp_adaptive_tab" in settings:
++            self._settings.setValue(self._EXP_ADAPTIVE_KEY,
++                                    bool(settings["exp_adaptive_tab"]))
+ 
+     def _on_paths_changed(self, kind: str, path: str) -> None:
+         self._log_widget.append("INFO", f"Path changed: {kind} -> {path}")
+@@ -331,6 +435,24 @@ class MainWindow(QMainWindow):
+             lambda tasks: self._resource_bar.set_queue_size(len(tasks)))
+         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
+ 
++        # Experience: реальные события контроллеров → пресеты
++        xp, ev = self._xp, self._xp_events
++        self._tts_ctrl.generation_complete.connect(
++            lambda _p: (xp.handle(ev.GENERATION_COMPLETE),
++                        self._usage.record_backend(self._tts_ctrl.backend()),
++                        self._usage.save()))
++        self._tts_ctrl.error_occurred.connect(lambda _m: xp.handle(ev.GENERATION_FAILED))
++        self._tts_ctrl.generation_started.connect(
++            lambda: self._record_action("tts_generate"))
++        self._chat_ctrl.generation_started.connect(
++            lambda: self._record_action("chat_send"))
++        self._chat_ctrl.message_received.connect(lambda _m: xp.handle(ev.CHAT_REPLY))
++        self._model_ctrl.download_finished.connect(
++            lambda name: (self._record_action("download"),
++                          xp.handle(ev.DOWNLOAD_FINISHED, {"output": name})))
++        self._queue_ctrl.queue_changed.connect(self._xp_queue_watch)
++        self._workspace_tabs.currentChanged.connect(self._on_tab_activated)
++
+     def _refresh_chat_models(self) -> None:
+         """Каталог моделей активного провайдера → селектор чата."""
+         try:
+@@ -424,8 +546,14 @@ class MainWindow(QMainWindow):
+             self.restoreState(state)
+ 
+     def closeEvent(self, event) -> None:
++        import time
+         self._settings.setValue(self._WINDOW_GEOMETRY_KEY, self.saveGeometry())
+         self._settings.setValue(self._WINDOW_STATE_KEY, self.saveState())
++        try:
++            self._usage.record_active_seconds(time.time() - self._session_t0)
++            self._usage.save()
++        except Exception:
++            pass
+         super().closeEvent(event)
+ 
+     # ── Project persistence (реальный JSON, без диалогов для тестов) ──
+@@ -469,6 +597,8 @@ class MainWindow(QMainWindow):
+         import json
+         with open(path, "w", encoding="utf-8") as f:
+             json.dump(self._serialize_project(), f, ensure_ascii=False, indent=2)
++        self._record_action("project_save")
++        self._xp.handle(self._xp_events.PROJECT_SAVED, {"output": path})
+         return path
+ 
+     def load_project_from(self, path: str) -> str:
+@@ -476,6 +606,8 @@ class MainWindow(QMainWindow):
+         with open(path, "r", encoding="utf-8") as f:
+             data = json.load(f)
+         self._apply_project(data)
++        self._record_action("project_load")
++        self._xp.handle(self._xp_events.PROJECT_LOADED, {"output": path})
+         return path
+ 
+     def _clear_project(self) -> None:
+@@ -484,6 +616,7 @@ class MainWindow(QMainWindow):
+         self._chat_workspace.load_messages([])
+         self._chat_workspace.set_system_prompt("")
+         self._pipeline_workspace._input.setPlainText("")
++        self._xp.handle(self._xp_events.PROJECT_NEW)
+ 
+     # ── Menu slots ──
+     def _on_new_project(self) -> None:
+@@ -549,6 +682,8 @@ class MainWindow(QMainWindow):
+             return
+         self._toast(f'{tr("ctl_export_done")}\n{out}', "success")
+         self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
++        self._record_action("export")
++        self._xp.handle(self._xp_events.EXPORT_DONE, {"output": out})
+ 
+     def _on_manage_models(self) -> None:
+         # Поднимаем реальный Model Hub dock и обновляем скан
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py b/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py
+index c058766..3eab78f 100644
+--- a/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py
++++ b/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py
+@@ -63,6 +63,12 @@ class SettingsPanel(QWidget):
+         self._auto_save = QCheckBox()
+         self._auto_save.setChecked(True)
+         gen_form.addRow(self._auto_save)
++        self._exp_sounds = QCheckBox()
++        self._exp_sounds.setChecked(True)
++        gen_form.addRow(self._exp_sounds)
++        self._exp_adaptive = QCheckBox()
++        self._exp_adaptive.setChecked(True)
++        gen_form.addRow(self._exp_adaptive)
+         self._gen_group.set_content_layout(gen_form)
+         layout.addWidget(self._gen_group)
+ 
+@@ -157,6 +163,8 @@ class SettingsPanel(QWidget):
+         self._threads.valueChanged.connect(lambda _v: self._emit_settings())
+         self._batch.valueChanged.connect(lambda _v: self._emit_settings())
+         self._auto_save.toggled.connect(lambda _v: self._emit_settings())
++        self._exp_sounds.toggled.connect(lambda _v: self._emit_settings())
++        self._exp_adaptive.toggled.connect(lambda _v: self._emit_settings())
+ 
+         self.retranslate_ui()
+ 
+@@ -170,6 +178,8 @@ class SettingsPanel(QWidget):
+             "worker_threads": self._threads.value(),
+             "batch_size": self._batch.value(),
+             "auto_save": self._auto_save.isChecked(),
++            "exp_sounds": self._exp_sounds.isChecked(),
++            "exp_adaptive_tab": self._exp_adaptive.isChecked(),
+             "models_dir": self._dirs["models"],
+             "output_dir": self._dirs["output"],
+         }
+@@ -185,6 +195,15 @@ class SettingsPanel(QWidget):
+             self._lang.setCurrentIndex(idx)
+             self._lang.blockSignals(False)
+ 
++    def set_exp_options(self, sounds: bool, adaptive_tab: bool) -> None:
++        """Программно выставляет тумблеры experience-слоя (без эмиссии)."""
++        self._exp_sounds.blockSignals(True)
++        self._exp_adaptive.blockSignals(True)
++        self._exp_sounds.setChecked(bool(sounds))
++        self._exp_adaptive.setChecked(bool(adaptive_tab))
++        self._exp_sounds.blockSignals(False)
++        self._exp_adaptive.blockSignals(False)
++
+     def set_dir(self, kind: str, path: str) -> None:
+         if kind in self._dirs and path:
+             self._dirs[kind] = path
+@@ -197,6 +216,8 @@ class SettingsPanel(QWidget):
+         self._theme.setItemText(0, tr("theme_dark"))
+         self._lang_lbl.setText(tr("set_language"))
+         self._auto_save.setText(tr("set_autosave"))
++        self._exp_sounds.setText(tr("exp_sounds"))
++        self._exp_adaptive.setText(tr("exp_adaptive_tab"))
+         self._perf_group.set_title(tr("set_performance"))
+         self._device_lbl.setText(tr("set_device"))
+         self._device.setItemText(0, tr("device_auto"))
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/presets/experience.default.json b/ai_studio_core/ai_studio_core/ui/theme/presets/experience.default.json
+new file mode 100644
+index 0000000..fc9338b
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/theme/presets/experience.default.json
+@@ -0,0 +1,39 @@
++{
++  "name": "default",
++  "description": "Experience preset: событие → действия. Toast добавляется только там, где приложение ещё не показывает свой; звук/пульс — везде.",
++  "events": {
++    "app_started": {
++      "sound": "start_soft"
++    },
++    "generation_complete": {
++      "sound": "done_chime",
++      "accent_pulse": {"color": "#10b981", "duration_ms": 900}
++    },
++    "generation_failed": {
++      "sound": "error_low",
++      "accent_pulse": {"color": "#ef4444", "duration_ms": 900}
++    },
++    "queue_drained": {
++      "toast": {"variant": "success", "text": "exp_queue_drained"},
++      "sound": "success_soft"
++    },
++    "project_saved": {
++      "sound": "success_soft"
++    },
++    "project_loaded": {
++      "sound": "start_soft"
++    },
++    "project_new": {
++      "sound": "tick"
++    },
++    "download_finished": {
++      "sound": "done_chime"
++    },
++    "export_done": {
++      "sound": "tick"
++    },
++    "chat_reply": {
++      "sound": "tick"
++    }
++  }
++}
+diff --git a/ai_studio_core/test/test_experience_layer.py b/ai_studio_core/test/test_experience_layer.py
+new file mode 100644
+index 0000000..ef9f6c8
+--- /dev/null
++++ b/ai_studio_core/test/test_experience_layer.py
+@@ -0,0 +1,296 @@
++# -*- coding: utf-8 -*-
++"""Experience layer (этап 12): реальные звуки, валидация пресетов,
++менеджер событий, статистика и эвристика стартовой вкладки.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++import wave
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="менеджер/пульс — Qt")
++
++from PySide6.QtWidgets import QApplication
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _wait_ms(app, ms):
++    t0 = time.time()
++    while (time.time() - t0) * 1000 < ms:
++        app.processEvents()
++        time.sleep(0.01)
++
++
++# ── Уровень 1: реальные звуки ────────────────────────────────────────────────
++
++class TestTones:
++    def test_every_tone_synthesizes_real_wav(self, tmp_path):
++        from ai_studio_core.ui.experience import sounds
++
++        for name in sounds.available_tones():
++            path = sounds.tone_path(name, cache_dir=str(tmp_path))
++            with wave.open(path, "rb") as wf:
++                assert wf.getframerate() == sounds.SAMPLE_RATE
++                assert wf.getnchannels() == 1
++                assert wf.getsampwidth() == 2
++                frames = wf.readframes(wf.getnframes())
++            assert os.path.getsize(path) > 500, "анти-пустышка"
++            import numpy as np
++            data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
++            assert float(np.abs(data).max()) > 0.05, "анти-тишина"
++            expected = sum(d for _f, d in sounds.TONES[name])
++            actual = len(data) / sounds.SAMPLE_RATE
++            assert abs(actual - expected) < 0.01
++
++    def test_tone_caching_avoids_resynthesis(self, tmp_path):
++        from ai_studio_core.ui.experience import sounds
++        p1 = sounds.tone_path("tick", cache_dir=str(tmp_path))
++        mtime = os.path.getmtime(p1)
++        p2 = sounds.tone_path("tick", cache_dir=str(tmp_path))
++        assert p1 == p2 and os.path.getmtime(p2) == mtime
++
++    def test_unknown_tone_rejected(self):
++        from ai_studio_core.ui.experience import sounds
++        with pytest.raises(ValueError, match="unknown tone"):
++            sounds.tone_wav("nope")
++
++
++# ── Уровень 1: пресеты ───────────────────────────────────────────────────────
++
++class TestPresets:
++    def test_default_preset_valid(self):
++        from ai_studio_core.ui.experience import presets
++        mapping = presets.load_preset()
++        assert "generation_complete" in mapping
++        assert mapping["generation_complete"]["sound"] == "done_chime"
++        assert "accent_pulse" in mapping["generation_complete"]
++
++    def test_unknown_event_rejected(self):
++        from ai_studio_core.ui.experience import presets
++        with pytest.raises(ValueError, match="unknown event"):
++            presets.validate_preset({"events": {"turn_off_lights": {}}})
++
++    def test_unknown_action_and_tone_rejected(self):
++        from ai_studio_core.ui.experience import presets
++        with pytest.raises(ValueError, match="unknown actions"):
++            presets.validate_preset({"events": {"app_started": {"fireworks": {}}}})
++        with pytest.raises(ValueError, match="unknown tone"):
++            presets.validate_preset({"events": {"app_started": {"sound": "bogus"}}})
++
++    def test_merge_user_override(self, tmp_path):
++        from ai_studio_core.ui.experience import presets
++        base = presets.load_preset()
++        user = tmp_path / "user.json"
++        user.write_text(json.dumps({"events": {
++            "app_started": {"sound": "tick"}}}), encoding="utf-8")
++        merged = presets.merge_presets(base, str(user))
++        assert merged["app_started"]["sound"] == "tick"
++        # остальные события базового пресета не пострадали
++        assert merged["generation_complete"] == base["generation_complete"]
++
++
++# ── Уровень 1: менеджер ──────────────────────────────────────────────────────
++
++class TestExperienceManager:
++    def _manager(self):
++        from ai_studio_core.ui.experience import events, presets
++        from ai_studio_core.ui.experience.manager import ExperienceManager
++        calls = {"toast": [], "pulse": [], "play": [], "status": []}
++        mgr = ExperienceManager(
++            toast_cb=lambda t, v: calls["toast"].append((t, v)),
++            pulse_cb=lambda c, ms: calls["pulse"].append((c, ms)),
++            status_cb=lambda m: calls["status"].append(m),
++        )
++        mgr.configure(presets.load_preset())
++        mgr._play = lambda name: calls["play"].append(name)  # без аудио-устройства
++        return mgr, calls, events
++
++    def test_event_executes_preset_actions(self, app):
++        mgr, calls, events = self._manager()
++        assert mgr.handle(events.GENERATION_COMPLETE) is True
++        assert calls["play"] == ["done_chime"]
++        assert calls["pulse"] and calls["pulse"][0][0] == "#10b981"
++
++    def test_sounds_disabled_skips_play_but_keeps_pulse(self, app):
++        mgr, calls, events = self._manager()
++        mgr.set_sounds_enabled(False)
++        mgr.handle(events.GENERATION_COMPLETE)
++        assert calls["play"] == []
++        assert calls["pulse"], "пульс остаётся — звук отключается отдельно"
++
++    def test_toast_text_resolution(self, app):
++        from ai_studio_core.i18n import t as tr
++        from ai_studio_core.ui.experience.manager import resolve_text
++        # i18n-ключ переводится
++        assert resolve_text("exp_queue_drained") == tr("exp_queue_drained")
++        # литерал с плейсхолдером
++        assert resolve_text("Saved: {output}", {"output": "/tmp/x.json"}) == \
++            "Saved: /tmp/x.json"
++        # отсутствующий плейсхолдер не роняет
++        assert resolve_text("Saved: {missing}") == "Saved: {missing}"
++
++    def test_unknown_event_is_honest_false(self, app):
++        mgr, calls, _events = self._manager()
++        assert mgr.handle("alien_event") is False
++        assert calls == {"toast": [], "pulse": [], "play": [], "status": []}
++
++
++class TestAccentPulse:
++    def test_pulse_shows_then_autohides(self, app):
++        from ai_studio_core.ui.experience.manager import AccentPulse
++        from PySide6.QtWidgets import QWidget
++
++        host = QWidget()
++        host.resize(800, 600)
++        host.show()
++        bar = AccentPulse(host)
++        bar.pulse("#10b981", 200)
++        app.processEvents()
++        assert bar.isVisible()
++        assert bar.width() == 800
++        _wait_ms(app, 1000)
++        assert not bar.isVisible(), "пульс обязан самоудалиться"
++        host.close()
++
++
++# ── Уровень 2: статистика и эвристика ────────────────────────────────────────
++
++class TestUsageStats:
++    def test_record_and_roundtrip(self, tmp_path):
++        from ai_studio_core.ui.experience.stats import UsageStats
++
++        path = str(tmp_path / "usage.json")
++        s = UsageStats(path=path)
++        s.record_session()
++        s.record_activation("chat")
++        s.record_activation("chat")
++        s.record_action("chat_send")
++        s.record_backend("espeak")
++        s.record_active_seconds(12.5)
++        s.save()
++
++        raw = json.loads(open(path, encoding="utf-8").read())
++        assert raw["sessions"] == 1
++        assert raw["workspace_activations"]["chat"] == 2
++
++        s2 = UsageStats.load(path)
++        assert s2.activations()["chat"] == 2
++        assert s2.data()["backend_use"] == {"espeak": 1}
++        assert s2.data()["session_seconds_total"] == 12.5
++
++    def test_load_missing_file_is_empty_not_crash(self, tmp_path):
++        from ai_studio_core.ui.experience.stats import UsageStats
++        s = UsageStats.load(str(tmp_path / "none.json"))
++        assert s.data()["sessions"] == 0
++
++    def test_junk_fields_ignored_honestly(self, tmp_path):
++        from ai_studio_core.ui.experience.stats import UsageStats
++        path = tmp_path / "usage.json"
++        path.write_text(json.dumps({
++            "sessions": 5, "alien": 1,
++            "workspace_activations": {"chat": 7, "alien_ws": 99}}), encoding="utf-8")
++        s = UsageStats.load(str(path))
++        assert s.data()["sessions"] == 5
++        assert "alien" not in s.data()
++        assert "alien_ws" not in s.activations()
++
++    def test_heuristic_threshold_tie_and_winner(self):
++        from ai_studio_core.ui.experience.stats import (
++            UsageStats, suggested_start_workspace,
++        )
++        s = UsageStats(path="unused")
++        ws, reason = suggested_start_workspace(s)
++        assert ws == "tts" and "недостаточно" in reason
++
++        for _ in range(5):
++            s.record_activation("chat")
++        s.record_activation("pipeline")
++        ws, reason = suggested_start_workspace(s)
++        assert ws == "chat" and "5/6" in reason
++
++        s2 = UsageStats(path="unused")
++        for _ in range(3):
++            s2.record_activation("chat")
++        for _ in range(3):
++            s2.record_activation("tts")
++        ws, reason = suggested_start_workspace(s2)
++        assert ws == "tts" and "ничья" in reason
++
++
++# ── Интеграция: адаптивная стартовая вкладка и тумблер звуков ───────────────
++
++@pytest.fixture()
++def window_factory(app, tmp_path, monkeypatch):
++    from PySide6.QtCore import QSettings
++    from ai_studio_core.ui.experience import stats as xp_stats
++
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
++    QSettings("ai_studio", "studio").clear()
++    stats_file = tmp_path / "usage_stats.json"
++    monkeypatch.setattr(xp_stats, "STATS_PATH", str(stats_file))
++
++    def _make(seed_activations: dict | None = None, adaptive: bool = True,
++              sounds: bool = True):
++        if seed_activations:
++            s = xp_stats.UsageStats(path=str(stats_file))
++            for ws, n in seed_activations.items():
++                for _ in range(n):
++                    s.record_activation(ws)
++            s.save()
++        QSettings("ai_studio", "studio").setValue("ui/adaptive_start_tab", adaptive)
++        QSettings("ai_studio", "studio").setValue("ui/exp_sounds", sounds)
++        from ai_studio_core.ui.main_window import MainWindow
++        return MainWindow()
++    return _make
++
++
++class TestAdaptiveStartIntegration:
++    def test_most_used_workspace_becomes_start_tab(self, window_factory):
++        w = window_factory(seed_activations={"chat": 6, "tts": 1})
++        assert w._workspace_tabs.currentWidget() is w._chat_workspace
++        assert w._usage.activations()["chat"] == 6  # программный выбор не засчитан
++
++    def test_toggle_off_gives_default_tab(self, window_factory):
++        w = window_factory(seed_activations={"chat": 9}, adaptive=False)
++        assert w._workspace_tabs.currentIndex() == 0  # дефолт — TTS
++
++    def test_no_stats_gives_default_tab(self, window_factory):
++        w = window_factory()
++        assert w._workspace_tabs.currentIndex() == 0
++
++    def test_sounds_toggle_propagates(self, window_factory):
++        w = window_factory(sounds=False)
++        assert w._xp.sounds_enabled() is False
++        w2 = window_factory(sounds=True)
++        assert w2._xp.sounds_enabled() is True
++
++    def test_tab_switch_records_activation(self, window_factory):
++        w = window_factory()
++        chat_idx = w._tab_index_for("chat")
++        w._workspace_tabs.setCurrentIndex(chat_idx)
++        assert w._usage.activations()["chat"] == 1
++        # и на диск тоже
++        s2 = w._xp_stats_mod.UsageStats.load()
++        assert s2.activations()["chat"] == 1
++
++    def test_queue_drained_event_fires_once(self, window_factory):
++        from ai_studio_core.ui.experience import events
++        w = window_factory()
++        seen = []
++        orig = w._xp.handle
++        w._xp.handle = lambda e, p=None: seen.append(e) or orig(e, p)
++        tid = w._queue_ctrl.add_task("TTS", "espeak", {})
++        QApplication.processEvents()
++        w._queue_ctrl.set_task_progress(tid, 100, "done")
++        QApplication.processEvents()
++        assert seen.count(events.QUEUE_DRAINED) == 1
+diff --git a/ai_studio_core/test/test_project_and_pipeline_real.py b/ai_studio_core/test/test_project_and_pipeline_real.py
+index 8073ad8..74e6879 100644
+--- a/ai_studio_core/test/test_project_and_pipeline_real.py
++++ b/ai_studio_core/test/test_project_and_pipeline_real.py
+@@ -38,10 +38,12 @@ def _wait(app, cond, timeout=30.0):
+ 
+ @pytest.fixture()
+ def window(app, tmp_path, monkeypatch):
+-    """MainWindow с изолированными QSettings."""
++    """MainWindow с изолированными QSettings и usage-статистикой."""
+     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+     from PySide6.QtCore import QSettings
+     QSettings("ai_studio", "studio").clear()
++    from ai_studio_core.ui.experience import stats as xp_stats
++    monkeypatch.setattr(xp_stats, "STATS_PATH", str(tmp_path / "usage_stats.json"))
+     from ai_studio_core.ui.main_window import MainWindow
+     return MainWindow()
+ 
+diff --git a/ai_studio_core/test/test_ui_language_switch.py b/ai_studio_core/test/test_ui_language_switch.py
+index a7206e2..fa71f86 100644
+--- a/ai_studio_core/test/test_ui_language_switch.py
++++ b/ai_studio_core/test/test_ui_language_switch.py
+@@ -33,13 +33,17 @@ def app():
+ 
+ @pytest.fixture()
+ def window(app, tmp_path, monkeypatch):
+-    """Свежее главное окно с изолированным QSettings."""
++    """Свежее главное окно с изолированным QSettings и usage-статистикой."""
+     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+     import importlib
+     s = QSettings("ai_studio", "studio")
+     s.clear()
+     s.sync()
+ 
++    # Experience-статистика — в tmp, репозиторий не мусорим
++    from ai_studio_core.ui.experience import stats as xp_stats
++    monkeypatch.setattr(xp_stats, "STATS_PATH", str(tmp_path / "usage_stats.json"))
++
+     from ai_studio_core.ui.main_window import MainWindow
+     w = MainWindow()
+     yield w
+diff --git a/ui_experience_pulse.png b/ui_experience_pulse.png
+new file mode 100644
+index 0000000..81fbe79
+Binary files /dev/null and b/ui_experience_pulse.png differ
