@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "sessions": 1,
+  "session_seconds_total": 0.0,
+  "workspace_activations": {
+    "tts": 0,
+    "chat": 0,
+    "image": 0,
+    "pipeline": 0
+  },
+  "actions": {},
+  "backend_use": {}
+}

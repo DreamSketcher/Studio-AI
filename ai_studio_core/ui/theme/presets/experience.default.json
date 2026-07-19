@@ -1,0 +1,39 @@
+{
+  "name": "default",
+  "description": "Experience preset: событие → действия. Toast добавляется только там, где приложение ещё не показывает свой; звук/пульс — везде.",
+  "events": {
+    "app_started": {
+      "sound": "start_soft"
+    },
+    "generation_complete": {
+      "sound": "done_chime",
+      "accent_pulse": {"color": "#10b981", "duration_ms": 900}
+    },
+    "generation_failed": {
+      "sound": "error_low",
+      "accent_pulse": {"color": "#ef4444", "duration_ms": 900}
+    },
+    "queue_drained": {
+      "toast": {"variant": "success", "text": "exp_queue_drained"},
+      "sound": "success_soft"
+    },
+    "project_saved": {
+      "sound": "success_soft"
+    },
+    "project_loaded": {
+      "sound": "start_soft"
+    },
+    "project_new": {
+      "sound": "tick"
+    },
+    "download_finished": {
+      "sound": "done_chime"
+    },
+    "export_done": {
+      "sound": "tick"
+    },
+    "chat_reply": {
+      "sound": "tick"
+    }
+  }
+}

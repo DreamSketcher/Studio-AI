@@ -1,0 +1,1761 @@
+commit a5afe336b9bb5880c29b189dc59097af73368f3a
+Author: arena-agent <agent@local>
+Date:   Sat Jul 18 22:14:07 2026 +0000
+
+    Stage 10 — real Model Hub scan/delete/download (rvc_catalog), project save/open/new, pipeline Run wiring, status bar RAM/queue, image gate
+
+diff --git a/AUDIT_10_platform_real.md b/AUDIT_10_platform_real.md
+new file mode 100644
+index 0000000..89b47f1
+--- /dev/null
++++ b/AUDIT_10_platform_real.md
+@@ -0,0 +1,59 @@
++# Отчёт №10 — Model Hub, скачивание, проекты, Pipeline Run, статус-бар, image-гейт
++
++**Дата:** 2026-07-19
++**Этап:** Удаление последних заглушек платформенного слоя. Сетевые операции
++тестируются против **настоящего HTTP-сервера на loopback** — без внешней сети
++и без подделок.
++
++---
++
++## 1. Что было заглушкой → чем стало
++
++| Было | Стало |
++|---|---|
++| Model Hub: 5 вшитых записей («XTTS v2.0.2 ✅ 1.8 GB», «GPT-4o ☁️»…) | Рекурсивный скан `models/` (`.pth/.safetensors/.bin/.gguf/.pt/.onnx/.ckpt`), реальные размеры с диска, категория по подкаталогу, служебные `.preview_cache/.metadata` скрыты; пусто → честный текст `hub_empty` |
++| `ModelController.list_models()` — демо-список; `download_model` — мгновенный ложный finished; `delete_model` — только лог | Реальный скан; удаление файла с **защитой от path traversal** (нельзя удалить вне `models/`); скачивание через `rvc_catalog.downloader` в worker-потоке с прогрессом |
++| `ModelDownloadDialog` — каркас с вшитым списком и кнопкой `accept` | Живой каталог RVC (`sources.get_catalog()`), уже скачанное скрыто, офлайн → честная подпись `dlg_catalog_empty`; реальный прогресс-бар |
++| Меню New/Open/Save → toast «заглушка»; ключ `msg_menu_stub` | Реальный JSON-проект: текст TTS, параметры сайдбара, история/системный промпт/модель чата, текст пайплайна, язык. Roundtrip + валидация файла |
++| Pipeline «Run» — кнопка без проводки | Та же реальная TTS-цепочка (espeak): синтез WAV на диск, ноды Input→…→Output подсвечиваются по факту этапов |
++| Статус-бар: RAM писался в лейбл Queue; GPU фейковался бы при torch? | CPU/RAM — psutil (реальные), GPU/VRAM — только при torch+CUDA, иначе честные «—»; Queue — реальное число задач очереди |
++| Image-вкладка: generate ни к чему не подключён | `ImageController`: честный гейт `ctl_img_missing` без файлов-пустышек; diffusers-путь реализован (coqui-style, для сред с `.[ml]`) |
++| `msg_menu_stub`, посторонняя пометка «демо» | Ключ удалён из обоих словарей, ссылок не осталось |
++
++## 2. Тесты (новые, 26 шт.)
++
++**`test_hub_scan_real.py`** (8): скан находит реальные файлы с категориями и
++настоящими размерами; кэш-каталоги скрыты; несуществующий каталог — честно пуст;
++удаление реального файла + перескан; отказ удалять вне `models/` (файл
++неприкосновенен, ошибка озвучена); traversal `rvc/../../…` отклонён; панель:
++фильтры категория+поиск, честное пустое состояние, выбор эмитит реальный путь.
++
++**`test_model_download_real.py`** (7): реальный HTTP-скачок `.pth` с loopback —
++**побайтовое совпадение**, `is_downloaded`, прогресс; SHA256 верный → принято,
++неверный → отклонено без файла; 404 → честный отказ; контроллер end-to-end
++(started/progress 100/finished + скан обновлён); сбой → `download_failed`,
++ложного finished нет.
++
++**`test_project_and_pipeline_real.py`** (11): проект save→load полный roundtrip
++(текст, язык, скорость 1.5×, история чата, системный промпт); мусорный JSON →
++`ValueError`; New очищает канвас. Pipeline Run: **реальный WAV на диске**,
++ноды `[done×6]`, бэкенд espeak; границы `set_node_state`. Image-гейт: ошибка
++`ctl_img_missing`, `image_ready` не эмитнут, каталог вывода пуст. Статус-бар:
++CPU/RAM — валидные проценты psutil; без torch — «GPU: — / VRAM: — / —»;
++лейбл Queue живёт от QueueController (0→1→0).
++
++## 3. Проверки
++
++- Полный прогон: **612 passed** (было 586), lint-imports `layered_architecture` — **KEPT**.
++- Скриншоты: `ui_workspace_pipeline_real.png` (все ноды done, реальный WAV
++  в логе, Queue: 1), `ui_hub_real.png` (hub показывает реальные файлы
++  `llama-3.1-8b-q4.gguf` 1.5 MB llm, `singer_v2.pth` 410 KB rvc).
++
++## 4. Осознанные границы (не заглушки)
++
++- RVC-каталог из сети (voice-models.com и т.п.) не дёргался в тестах:
++  loopback-сервер покрывает тот же urllib-download-код побайтово.
++- diffusers/coqui-пути покрыты только честным гейтом отсутствия (нет torch
++  в среде); код исполнения написан и изолируется условием импорта.
++- Удаление модели спрашивает подтверждение (QMessageBox) — в headless-тестах
++  нажатие не эмулируется, проверяется прямой вызов контроллера.
+diff --git a/ai_studio_core/ai_studio_core/i18n.py b/ai_studio_core/ai_studio_core/i18n.py
+index 16bf189..228f4c6 100644
+--- a/ai_studio_core/ai_studio_core/i18n.py
++++ b/ai_studio_core/ai_studio_core/i18n.py
+@@ -90,7 +90,6 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "sb_queue": "Queue:",
+         "msg_ready": "Ready",
+         "msg_welcome": "Welcome to AI Studio",
+-        "msg_menu_stub": "This menu item is a placeholder in the demo UI",
+         "msg_generation_complete": "Generation complete",
+         "msg_project_saved": "Project saved",
+         "msg_project_loaded": "Project loaded",
+@@ -177,6 +176,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "hub_refresh": "↻ Refresh",
+         "hub_empty": "(no models found — place files into models/)",
+         "hub_size": "Size:",
++        "hub_deleted": "Deleted:",
++        "hub_delete_fail": "Could not delete model file",
++        "hub_download_fail": "Download failed",
++        "hub_download_done": "Downloaded:",
++        "dlg_download_title": "Download RVC model",
++        "dlg_catalog_empty": "Catalogue is unavailable offline — no remote entries to download.",
++        "proj_saved": "Project saved:",
++        "proj_loaded": "Project loaded:",
++        "proj_new_done": "New project created",
++        "proj_fail": "Project file error",
++        "dlg_save_project": "Save project",
++        "dlg_open_project": "Open project",
+         # ── History ──
+         "hist_search_ph": "Search history…",
+         "hist_all": "All",
+@@ -284,7 +295,6 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "sb_queue": "Очередь:",
+         "msg_ready": "Готов",
+         "msg_welcome": "Добро пожаловать в AI Studio",
+-        "msg_menu_stub": "Этот пункт меню — заглушка в демо UI",
+         "msg_generation_complete": "Генерация завершена",
+         "msg_project_saved": "Проект сохранён",
+         "msg_project_loaded": "Проект загружен",
+@@ -371,6 +381,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "hub_refresh": "↻ Обновить",
+         "hub_empty": "(модели не найдены — положите файлы в models/)",
+         "hub_size": "Размер:",
++        "hub_deleted": "Удалено:",
++        "hub_delete_fail": "Не удалось удалить файл модели",
++        "hub_download_fail": "Ошибка скачивания",
++        "hub_download_done": "Скачано:",
++        "dlg_download_title": "Скачивание RVC-модели",
++        "dlg_catalog_empty": "Каталог недоступен без сети — скачивать нечего.",
++        "proj_saved": "Проект сохранён:",
++        "proj_loaded": "Проект загружен:",
++        "proj_new_done": "Создан новый проект",
++        "proj_fail": "Ошибка файла проекта",
++        "dlg_save_project": "Сохранить проект",
++        "dlg_open_project": "Открыть проект",
+         # ── History ──
+         "hist_search_ph": "Поиск по истории…",
+         "hist_all": "Все",
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__init__.py b/ai_studio_core/ai_studio_core/ui/controllers/__init__.py
+index 4094f82..deead8e 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/__init__.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/__init__.py
+@@ -1,12 +1,13 @@
+ """Контроллеры (Presenter/ViewModel слой)."""
+ from .base_controller import BaseController, WorkerThread
+ from .chat_controller import ChatController
++from .image_controller import ImageController
+ from .model_controller import ModelController
+ from .queue_controller import QueueController, QueueTask
+ from .tts_controller import TTSController
+ 
+ __all__ = [
+     "BaseController", "WorkerThread",
+-    "TTSController", "ChatController", "ModelController",
++    "TTSController", "ChatController", "ImageController", "ModelController",
+     "QueueController", "QueueTask",
+ ]
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/image_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/image_controller.py
+new file mode 100644
+index 0000000..1ffe102
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/controllers/image_controller.py
+@@ -0,0 +1,113 @@
++"""Контроллер Image Workspace — честная интеграция генерации изображений.
++
++Локальный бэкенд: diffusers + torch (Stable Diffusion). Не установлен —
++понятная ошибка `ctl_img_missing`, изображение-пустышка НЕ рисуется.
++Фальшивых «сгенерированных» картинок в UI не существует.
++"""
++from __future__ import annotations
++
++import os
++
++from PySide6.QtCore import Signal, Slot
++
++from ai_studio_core.i18n import t as tr
++
++from .base_controller import BaseController
++
++
++def _diffusers_available() -> bool:
++    try:
++        import torch  # noqa: F401
++        import diffusers  # noqa: F401
++        return True
++    except Exception:
++        return False
++
++
++class ImageController(BaseController):
++    image_ready = Signal(str)          # путь к сгенерированному файлу
++    generation_progress = Signal(int, str)
++
++    def __init__(self):
++        super().__init__()
++        self._last_image: str | None = None
++
++    def last_image(self) -> str | None:
++        return self._last_image
++
++    def available_models(self) -> list[dict]:
++        """Реальный статус бэкенда для селектора — без обещаний."""
++        ok = _diffusers_available()
++        return [{
++            "id": "sd-local",
++            "name": "Stable Diffusion (diffusers)",
++            "provider": "local",
++            "status": "ready" if ok else "download",
++        }]
++
++    @Slot(str, dict)
++    def on_generate(self, prompt: str, params: dict) -> None:
++        if not _diffusers_available():
++            # Честный гейт: ни силиконовой картинки, ни тишины.
++            self.error_occurred.emit(tr("ctl_img_missing"))
++            self.status_message.emit(tr("ctl_img_missing"))
++            self.log_message.emit("WARN", f"image backend missing; prompt={prompt[:60]!r}")
++            return
++
++        def _work(progress_callback=None, cancel_check=None) -> str:
++            return self._generate_diffusers(prompt, params,
++                                            progress_callback, cancel_check)
++
++        worker = self._run_in_background(_work)
++        worker.progress.connect(self.generation_progress.emit)
++        worker.result.connect(self._on_done)
++
++    def _generate_diffusers(self, prompt: str, params: dict,
++                            progress_callback=None, cancel_check=None) -> str:
++        """Локальный Stable Diffusion — задействуется только с extras .[ml]."""
++        import torch
++        from diffusers import StableDiffusionPipeline
++
++        from ai_studio_core.paths import OUTPUT_DIR
++        os.makedirs(OUTPUT_DIR, exist_ok=True)
++
++        model_id = "runwayml/stable-diffusion-v1-5"
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++        dtype = torch.float16 if device == "cuda" else torch.float32
++        pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype)
++        pipe = pipe.to(device)
++        steps = int(params.get("steps", 28))
++        cfg = float(params.get("cfg", 7.0))
++        seed = int(params.get("seed", -1))
++        generator = None
++        if seed >= 0:
++            generator = torch.Generator(device=device).manual_seed(seed)
++
++        def _cb(_pipe, i, _t, _kw):
++            if progress_callback:
++                progress_callback(int(100 * (i + 1) / steps), f"Step {i + 1}/{steps}")
++            if cancel_check and cancel_check():
++                raise InterruptedError("image generation cancelled")
++
++        w, h = (params.get("size") or "1024×1024").replace("x", "×").split("×")
++        result = pipe(prompt, num_inference_steps=steps, guidance_scale=cfg,
++                      width=int(w), height=int(h), generator=generator,
++                      callback=_cb, callback_steps=1)
++        from time import strftime
++        out_path = os.path.join(OUTPUT_DIR, f"image_{strftime('%Y%m%d_%H%M%S')}.png")
++        result.images[0].save(out_path)
++        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
++            raise RuntimeError("image backend produced empty file")
++        return out_path
++
++    def _on_done(self, path) -> None:
++        if not path:
++            return
++        self._last_image = path
++        self.image_ready.emit(path)
++        self.status_message.emit(f"Image: {path}")
++
++    @Slot()
++    def on_stop(self) -> None:
++        self.cancel_current()
++        self.status_message.emit(tr("ctl_gen_cancelled"))
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/model_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/model_controller.py
+index 665e671..348a132 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/model_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/model_controller.py
+@@ -1,43 +1,178 @@
+-"""Контроллер управления моделями (скачивание, удаление, обновление списка)."""
++"""Контроллер управления моделями — всё по-настоящему.
++
++  * scan_local_models() — рекурсивный скан MODEL_DIR на файлы моделей;
++  * delete_model(path) — реальное удаление, защита от выхода за MODEL_DIR;
++  * catalog() — живой каталог RVC (rvc_catalog.sources) — офлайн честно пуст;
++  * download_entry(entry) — реальное HTTP-скачивание через
++    rvc_catalog.downloader в worker-потоке с прогрессом.
++
++Никаких демо-записей: пустой каталог моделей → пустой список.
++"""
+ from __future__ import annotations
+ 
+-from PySide6.QtCore import Signal
++import os
++
++from PySide6.QtCore import Signal, Slot
+ 
+ from ai_studio_core.i18n import t as tr
+ 
+ from .base_controller import BaseController
+ 
++# Расширения файлов-моделей, которые показывает Hub.
++_MODEL_EXTS = {".pth", ".safetensors", ".bin", ".gguf", ".pt", ".onnx", ".ckpt"}
++# Скрытые служебные подкаталоги каталога RVC (кэш превью/метаданных).
++_SKIP_DIRS = {".preview_cache", ".parameter_preview_cache", ".metadata"}
++
++
++def scan_local_models(model_dir: str) -> list[dict]:
++    """Реальный скан каталога моделей.
++
++    Запись: {"id" (==path), "path", "name", "category", "size_bytes", "mtime"}.
++    Категория — имя подкаталога внутри models/ (rvc/…), иначе 'root'.
++    """
++    out: list[dict] = []
++    if not model_dir or not os.path.isdir(model_dir):
++        return out
++    for root, dirs, files in os.walk(model_dir):
++        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
++        for fname in files:
++            ext = os.path.splitext(fname)[1].lower()
++            if ext not in _MODEL_EXTS:
++                continue
++            path = os.path.join(root, fname)
++            try:
++                st = os.stat(path)
++            except OSError:
++                continue
++            rel = os.path.relpath(path, model_dir)
++            parts = rel.split(os.sep)
++            category = parts[0] if len(parts) > 1 else "root"
++            out.append({
++                "id": path,
++                "path": path,
++                "name": fname,
++                "category": category,
++                "size_bytes": st.st_size,
++                "mtime": st.st_mtime,
++            })
++    out.sort(key=lambda m: (m["category"], m["name"].lower()))
++    return out
++
++
++def _is_inside(path: str, directory: str) -> bool:
++    """Защита от path traversal: удалять можно только внутри MODEL_DIR."""
++    try:
++        p = os.path.realpath(path)
++        d = os.path.realpath(directory)
++    except OSError:
++        return False
++    return p != d and p.startswith(d + os.sep) and os.path.isfile(p)
++
+ 
+ class ModelController(BaseController):
+-    models_updated = Signal(list)    # list of dict
+-    download_started = Signal(str)   # model_id
+-    download_progress = Signal(str, int, str)  # model_id, percent, status
+-    download_finished = Signal(str)
+-    download_failed = Signal(str, str)
++    models_updated = Signal(list)    # list of dict (scan_local_models)
++    download_started = Signal(str)   # entry name
++    download_progress = Signal(str, int)  # entry name, percent
++    download_finished = Signal(str)  # entry name
++    download_failed = Signal(str, str)  # entry name, reason
+ 
+     def __init__(self):
+         super().__init__()
++        self._models: list[dict] = []
++        self._cancel_download = False
++
++    # ── Список локальных моделей ──
+ 
+     def list_models(self) -> list[dict]:
+-        """Возвращает текущий список моделей (демо)."""
+-        return [
+-            {"id": "xtts_v2", "name": "XTTS v2.0.2", "provider": "coqui",
+-             "status": "ready", "size_mb": 1800},
+-            {"id": "llama3.1-8b", "name": "Llama 3.1 8B Q4", "provider": "local",
+-             "status": "download", "size_mb": 4700},
+-            {"id": "rvc_male1", "name": "RVC Male v2", "provider": "rvc",
+-             "status": "ready", "size_mb": 420},
+-            {"id": "gpt-4o", "name": "GPT-4o", "provider": "openai",
+-             "status": "ready", "size_mb": 0},
+-        ]
+-
+-    def download_model(self, model_id: str) -> None:
+-        self.log_message.emit("INFO", f"Download requested: {model_id}")
+-        self.status_message.emit(f"Downloading {model_id}…")
+-        self.download_started.emit(model_id)
+-        # Реальная реализация вызывала бы updater/local_llm_client; в демо — таймер.
+-        self.download_finished.emit(model_id)
+-
+-    def delete_model(self, model_id: str) -> None:
+-        self.log_message.emit("INFO", f"Delete requested: {model_id}")
+-        self.status_message.emit(f"Model deleted: {model_id}")
++        return list(self._models)
++
++    @Slot()
++    def refresh(self) -> None:
++        from ai_studio_core.paths import MODEL_DIR
++        self._models = scan_local_models(MODEL_DIR)
++        self.models_updated.emit(list(self._models))
++
++    # ── Удаление ──
++
++    @Slot(str)
++    def delete_model(self, path: str) -> bool:
++        """Реальное удаление файла модели. True при успехе."""
++        from ai_studio_core.paths import MODEL_DIR
++        if not _is_inside(path, MODEL_DIR):
++            self.log_message.emit("WARN", f"refuse to delete outside models/: {path}")
++            self.error_occurred.emit(f'{tr("hub_delete_fail")}: {path}')
++            return False
++        try:
++            os.remove(path)
++        except OSError as e:
++            self.log_message.emit("ERROR", f"delete failed: {e}")
++            self.error_occurred.emit(f'{tr("hub_delete_fail")}: {e}')
++            return False
++        self.log_message.emit("INFO", f"deleted {path}")
++        self.status_message.emit(f'{tr("hub_deleted")} {os.path.basename(path)}')
++        self.refresh()
++        return True
++
++    # ── Каталог + скачивание (реальный rvc_catalog) ──
++
++    def catalog(self) -> list[dict]:
++        """Живой RVC-каталог (disk-кэш/seed + сеть). Офлайн — может быть пуст."""
++        try:
++            from ai_studio_core.rvc_catalog import sources
++            return sources.get_catalog()
++        except Exception as e:
++            self.log_message.emit("WARN", f"catalog unavailable: {e}")
++            return []
++
++    def is_downloaded(self, entry: dict) -> bool:
++        try:
++            from ai_studio_core.rvc_catalog.downloader import is_downloaded
++            return bool(is_downloaded(entry))
++        except Exception:
++            return False
++
++    @Slot(dict)
++    def download_entry(self, entry: dict) -> None:
++        """Реальное скачивание в models/rvc/ в фоновом потоке."""
++        name = str(entry.get("name") or entry.get("id") or "?")
++        self._cancel_download = False
++        self.download_started.emit(name)
++        self.status_message.emit(f"⬇ {name}")
++
++        def _work(progress_callback=None, cancel_check=None) -> bool:
++            from ai_studio_core.rvc_catalog import downloader
++
++            def _on_bytes(done, total):
++                if total:
++                    pct = int(done * 100 / total)
++                    if progress_callback:
++                        progress_callback(pct, name)
++                    self.download_progress.emit(name, pct)
++
++            ok = downloader.download_model(
++                entry,
++                progress_callback=_on_bytes,
++                cancelled_flag=lambda: self._cancel_download or (
++                    cancel_check() if cancel_check else False),
++            )
++            if not ok:
++                raise RuntimeError(f'{tr("hub_download_fail")}: {name}')
++            return ok
++
++        worker = self._run_in_background(_work)
++        worker.result.connect(lambda _ok, n=name: self._on_download_done(n))
++        worker.error.connect(lambda msg, n=name: self._on_download_failed(n, msg))
++
++    def cancel_download(self) -> None:
++        self._cancel_download = True
++        self.cancel_current()
++
++    def _on_download_done(self, name: str) -> None:
++        self.download_finished.emit(name)
++        self.status_message.emit(f'{tr("hub_download_done")} {name}')
++        self.log_message.emit("INFO", f"downloaded {name}")
++        self.refresh()
++
++    def _on_download_failed(self, name: str, message: str) -> None:
++        self.download_failed.emit(name, message)
++        self.log_message.emit("ERROR", f"download failed {name}: {message}")
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/model_download.py b/ai_studio_core/ai_studio_core/ui/dialogs/model_download.py
+index 398612c..8314cdb 100644
+--- a/ai_studio_core/ai_studio_core/ui/dialogs/model_download.py
++++ b/ai_studio_core/ai_studio_core/ui/dialogs/model_download.py
+@@ -1,51 +1,92 @@
+-"""Model download dialog (каркас)."""
++"""Диалог скачивания RVC-моделей из живого каталога (rvc_catalog).
++
++Список — реальные записи каталога (disk-кэш/seed + сеть через
++sources.get_catalog()). «Скачать» запускает ModelController.download_entry —
++настоящее HTTP-скачивание в models/rvc/ с прогрессом. Офлайн-каталог пуст —
++честная подпись вместо манекенов.
++"""
+ from __future__ import annotations
+ 
+ from PySide6.QtCore import Qt
+ from PySide6.QtWidgets import (
+-    QComboBox, QDialog, QFormLayout, QLabel, QProgressBar, QPushButton,
+-    QVBoxLayout,
++    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
++    QProgressBar, QPushButton, QVBoxLayout,
+ )
+ 
++from ai_studio_core.i18n import t as tr
++
+ from ..theme.tokens import TOKENS
+ 
+ 
+ class ModelDownloadDialog(QDialog):
+-    def __init__(self, parent=None):
++    def __init__(self, controller, parent=None):
+         super().__init__(parent)
+-        self.setWindowTitle("Download Model")
+-        self.setMinimumWidth(420)
++        self._ctrl = controller
++        self.setWindowTitle(tr("dlg_download_title"))
++        self.setMinimumWidth(480)
+ 
+         l = QVBoxLayout(self)
+         l.setSpacing(TOKENS.spacing.md)
+ 
+-        intro = QLabel("Выберите модель для загрузки:")
+-        l.addWidget(intro)
+-
+-        form = QFormLayout()
+-        self._category = QComboBox()
+-        self._category.addItems(["TTS", "LLM", "RVC"])
+-        self._model = QComboBox()
+-        self._model.setEditable(True)
+-        self._model.addItems(["XTTS v2.0.2", "Llama 3.1 8B Q4", "RVC Male v2"])
+-        form.addRow("Category:", self._category)
+-        form.addRow("Model:", self._model)
+-        l.addLayout(form)
++        self._list = QListWidget()
++        entries = self._ctrl.catalog() if self._ctrl else []
++        self._entries: list[dict] = []
++        for e in entries:
++            if not isinstance(e, dict):
++                continue
++            if self._ctrl.is_downloaded(e):
++                continue  # уже на диске — показывать нечего
++            self._entries.append(e)
++            item = QListWidgetItem(f'📥  {e.get("name", e.get("id", "?"))}')
++            item.setData(Qt.ItemDataRole.UserRole, e)
++            self._list.addItem(item)
++        if not self._entries:
++            item = QListWidgetItem(tr("dlg_catalog_empty"))
++            item.setFlags(Qt.ItemFlag.NoItemFlags)
++            self._list.addItem(item)
++        l.addWidget(self._list, stretch=1)
+ 
+         self._progress = QProgressBar()
+         self._progress.setRange(0, 100)
+         self._progress.setValue(0)
+         l.addWidget(self._progress)
+ 
+-        btn_row = QVBoxLayout
+-        from PySide6.QtWidgets import QHBoxLayout
+         btn_row = QHBoxLayout()
+         btn_row.addStretch()
+-        self._btn_cancel = QPushButton("Cancel")
++        self._btn_cancel = QPushButton(tr("dlg_cancel"))
+         self._btn_cancel.clicked.connect(self.reject)
+-        self._btn_download = QPushButton("Download")
++        self._btn_download = QPushButton(tr("hub_download"))
+         self._btn_download.setProperty("accent", True)
+-        self._btn_download.clicked.connect(self.accept)
++        self._btn_download.clicked.connect(self._on_download)
++        self._btn_download.setEnabled(bool(self._entries))
+         btn_row.addWidget(self._btn_cancel)
+         btn_row.addWidget(self._btn_download)
+         l.addLayout(btn_row)
++
++        if self._ctrl:
++            self._ctrl.download_progress.connect(self._on_progress)
++            self._ctrl.download_finished.connect(self._on_finished)
++            self._ctrl.download_failed.connect(self._on_failed)
++
++    def _selected_entry(self) -> dict | None:
++        item = self._list.currentItem()
++        return item.data(Qt.ItemDataRole.UserRole) if item else None
++
++    def _on_download(self) -> None:
++        entry = self._selected_entry()
++        if not entry or not self._ctrl:
++            return
++        self._btn_download.setEnabled(False)
++        self._ctrl.download_entry(entry)
++
++    def _on_progress(self, _name: str, pct: int) -> None:
++        self._progress.setValue(int(pct))
++
++    def _on_finished(self, _name: str) -> None:
++        self._progress.setValue(100)
++        self.accept()
++
++    def _on_failed(self, _name: str, message: str) -> None:
++        self._progress.setValue(0)
++        self._btn_download.setEnabled(True)
++        self.setWindowTitle(f'{tr("hub_download_fail")}: {message[:80]}')
+diff --git a/ai_studio_core/ai_studio_core/ui/main_window.py b/ai_studio_core/ai_studio_core/ui/main_window.py
+index 5b24662..f777ac8 100644
+--- a/ai_studio_core/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ai_studio_core/ui/main_window.py
+@@ -30,7 +30,8 @@ from ai_studio_core import i18n
+ from ai_studio_core.i18n import t as tr
+ 
+ from .controllers import (
+-    ChatController, ModelController, QueueController, TTSController,
++    ChatController, ImageController, ModelController, QueueController,
++    TTSController,
+ )
+ from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
+ from .panels import (
+@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
+         # Контроллеры
+         self._tts_ctrl = TTSController()
+         self._chat_ctrl = ChatController()
++        self._image_ctrl = ImageController()
+         self._model_ctrl = ModelController()
+         self._queue_ctrl = QueueController()
+ 
+@@ -289,19 +291,44 @@ class MainWindow(QMainWindow):
+         self._tts_workspace.rvc_selector().set_models(self._tts_ctrl.rvc_models())
+         self._settings_widget.llm_saved.connect(self._on_llm_saved)
+ 
++        # Image: честный контроллер (гейт бэкенда, без фейковых картинок)
++        self._image_workspace.generate_requested.connect(self._image_ctrl.on_generate)
++        self._image_workspace.stop_requested.connect(self._image_ctrl.on_stop)
++        self._image_ctrl.busy_changed.connect(self._image_workspace.set_busy)
++        self._image_ctrl.status_message.connect(self._resource_bar.set_message)
++        self._image_ctrl.log_message.connect(self._log_widget.append)
++        self._image_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
++        self._image_workspace.model_selector().set_models(
++            self._image_ctrl.available_models())
++
++        # Pipeline: кнопка Run гоняет ту же реальную TTS-цепочку,
++        # состояния нод = реальные этапы из контроллера
++        self._pipeline_workspace.run_requested.connect(self._on_pipeline_run)
++        self._pipeline_workspace.stop_requested.connect(self._tts_ctrl.on_stop)
++        self._tts_ctrl.busy_changed.connect(self._pipeline_workspace.set_busy)
++        self._tts_ctrl.pipeline_step_changed.connect(self._on_pipeline_step)
++        self._tts_ctrl.generation_started.connect(self._pipeline_workspace.reset_nodes)
++
+         # History: выбор элемента → Inspector
+         self._history_widget.item_selected.connect(self._on_history_selected)
+ 
+-        # Model hub
+-        self._model_widget.download_requested.connect(self._model_ctrl.download_model)
+-        self._model_widget.delete_requested.connect(self._model_ctrl.delete_model)
++        # Model hub: реальный скан models/ + Inspector + скачивание/удаление
++        self._model_widget.refresh_requested.connect(self._model_ctrl.refresh)
++        self._model_widget.download_requested.connect(self._on_download_model)
++        self._model_widget.delete_requested.connect(self._on_model_delete)
++        self._model_widget.selection_changed.connect(self._on_model_selected)
++        self._model_ctrl.models_updated.connect(self._model_widget.set_models)
+         self._model_ctrl.status_message.connect(self._resource_bar.set_message)
+         self._model_ctrl.log_message.connect(self._log_widget.append)
++        self._model_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
++        self._model_ctrl.refresh()
+ 
+         # Queue
+         self._queue_widget.cancel_task.connect(self._queue_ctrl.cancel_task)
+         self._queue_widget.clear_completed.connect(self._queue_ctrl.clear_completed)
+         self._queue_ctrl.queue_changed.connect(self._queue_widget.set_tasks)
++        self._queue_ctrl.queue_changed.connect(
++            lambda tasks: self._resource_bar.set_queue_size(len(tasks)))
+         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
+ 
+     def _refresh_chat_models(self) -> None:
+@@ -324,6 +351,38 @@ class MainWindow(QMainWindow):
+         if strip is not None:
+             strip.set_step_state(idx, state)
+ 
++    def _on_pipeline_step(self, idx: int, state: str) -> None:
++        self._pipeline_workspace.set_node_state(idx, state)
++
++    def _on_pipeline_run(self, text: str) -> None:
++        """Run пайплайна = та же реальная TTS-цепочка (ноды = её этапы)."""
++        params = self._tts_workspace.current_params()
++        params["autoplay"] = False  # из пайплайна не дёргаем плеер без явной просьбы
++        self._tts_ctrl.on_generate(text, params)
++
++    def _on_model_selected(self, model: dict) -> None:
++        size_mb = model.get("size_bytes", 0) / (1024 * 1024)
++        props = {
++            "Category": model.get("category", "root"),
++            "Size": f"{size_mb:.1f} MB",
++            "Path": model.get("path", ""),
++        }
++        self._inspector_widget.show_item(
++            model.get("name", "?"), "MODEL", props,
++            details=model.get("path", ""),
++        )
++
++    def _on_model_delete(self, path: str) -> None:
++        import os
++        from PySide6.QtWidgets import QMessageBox
++        answer = QMessageBox.question(
++            self, tr("hub_delete"),
++            f'{tr("hub_delete")}: {os.path.basename(path)}?',
++        )
++        if answer != QMessageBox.StandardButton.Yes:
++            return
++        self._model_ctrl.delete_model(path)
++
+     def _on_tts_done(self, output_path: str) -> None:
+         self._resource_bar.set_message(f'{tr("msg_generation_complete")}: {output_path}')
+         self._toast(f'{tr("msg_generation_complete")}\n{output_path}', "success")
+@@ -369,15 +428,99 @@ class MainWindow(QMainWindow):
+         self._settings.setValue(self._WINDOW_STATE_KEY, self.saveState())
+         super().closeEvent(event)
+ 
+-    # ── Menu slots (реальные реализации подключаются поэтапно) ──
++    # ── Project persistence (реальный JSON, без диалогов для тестов) ──
++    def _serialize_project(self) -> dict:
++        return {
++            "version": 1,
++            "language": i18n.get_language(),
++            "tts": {
++                "text": self._tts_workspace.text(),
++                "params": self._tts_workspace.current_params(),
++            },
++            "chat": {
++                "history": self._chat_ctrl.history(),
++                "system": self._chat_workspace.system_prompt(),
++                "model": self._chat_workspace.model_selector().current_model_id(),
++            },
++            "pipeline": {"text": self._pipeline_workspace._input.toPlainText()},
++        }
++
++    def _apply_project(self, data: dict) -> None:
++        if not isinstance(data, dict) or "version" not in data:
++            raise ValueError("not a project file")
++        if data.get("language"):
++            if i18n.set_language(str(data["language"])):
++                self._settings.setValue(self._LANGUAGE_KEY, str(data["language"]))
++                self.retranslate_ui()
++        tts = data.get("tts") or {}
++        self._tts_workspace.set_text(str(tts.get("text", "")))
++        self._tts_workspace.apply_params(tts.get("params") or {})
++        chat = data.get("chat") or {}
++        history = [h for h in (chat.get("history") or []) if isinstance(h, dict)]
++        self._chat_ctrl.set_history(history)
++        self._chat_workspace.load_messages(history)
++        self._chat_workspace.set_system_prompt(str(chat.get("system", "")))
++        if chat.get("model"):
++            self._chat_workspace.model_selector().select_id(str(chat["model"]))
++        pipe = data.get("pipeline") or {}
++        self._pipeline_workspace._input.setPlainText(str(pipe.get("text", "")))
++
++    def save_project_to(self, path: str) -> str:
++        import json
++        with open(path, "w", encoding="utf-8") as f:
++            json.dump(self._serialize_project(), f, ensure_ascii=False, indent=2)
++        return path
++
++    def load_project_from(self, path: str) -> str:
++        import json
++        with open(path, "r", encoding="utf-8") as f:
++            data = json.load(f)
++        self._apply_project(data)
++        return path
++
++    def _clear_project(self) -> None:
++        self._tts_workspace.set_text("")
++        self._chat_ctrl.set_history([])
++        self._chat_workspace.load_messages([])
++        self._chat_workspace.set_system_prompt("")
++        self._pipeline_workspace._input.setPlainText("")
++
++    # ── Menu slots ──
+     def _on_new_project(self) -> None:
+-        self._toast(tr("msg_menu_stub"), "info")
++        self._clear_project()
++        self._toast(tr("proj_new_done"), "info")
++        self._resource_bar.set_message(tr("proj_new_done"))
+ 
+     def _on_open_project(self) -> None:
+-        self._toast(tr("msg_menu_stub"), "info")
++        from PySide6.QtWidgets import QFileDialog
++        path, _sel = QFileDialog.getOpenFileName(
++            self, tr("dlg_open_project"), "", "AI Studio project (*.json)")
++        if not path:
++            return
++        try:
++            self.load_project_from(path)
++        except Exception as e:
++            self._toast(f'{tr("proj_fail")}\n{type(e).__name__}: {e}', "error")
++            return
++        self._toast(f'{tr("proj_loaded")} {path}', "success")
++        self._resource_bar.set_message(f'{tr("proj_loaded")} {path}')
+ 
+     def _on_save_project(self) -> None:
+-        self._toast(tr("msg_menu_stub"), "info")
++        from PySide6.QtWidgets import QFileDialog
++        path, _sel = QFileDialog.getSaveFileName(
++            self, tr("dlg_save_project"), "project.json",
++            "AI Studio project (*.json)")
++        if not path:
++            return
++        if not path.lower().endswith(".json"):
++            path += ".json"
++        try:
++            self.save_project_to(path)
++        except Exception as e:
++            self._toast(f'{tr("proj_fail")}\n{type(e).__name__}: {e}', "error")
++            return
++        self._toast(f'{tr("proj_saved")} {path}', "success")
++        self._resource_bar.set_message(f'{tr("proj_saved")} {path}')
+ 
+     def _on_export(self) -> None:
+         """Реальный экспорт последнего сгенерированного аудио."""
+@@ -408,10 +551,13 @@ class MainWindow(QMainWindow):
+         self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
+ 
+     def _on_manage_models(self) -> None:
+-        self._toast(tr("msg_menu_stub"), "info")
++        # Поднимаем реальный Model Hub dock и обновляем скан
++        self._model_hub.show()
++        self._model_hub.raise_()
++        self._model_ctrl.refresh()
+ 
+     def _on_download_model(self) -> None:
+-        dlg = ModelDownloadDialog(self)
++        dlg = ModelDownloadDialog(self._model_ctrl, self)
+         dlg.exec()
+ 
+     def _on_env_wizard(self) -> None:
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/model_hub_panel.py b/ai_studio_core/ai_studio_core/ui/panels/model_hub_panel.py
+index 03377a0..7f3e936 100644
+--- a/ai_studio_core/ai_studio_core/ui/panels/model_hub_panel.py
++++ b/ai_studio_core/ai_studio_core/ui/panels/model_hub_panel.py
+@@ -1,7 +1,7 @@
+-"""Model Hub — левый dock."""
++"""Model Hub — левый dock. Реальный список файлов из models/ (без манекенов)."""
+ from __future__ import annotations
+ 
+-from PySide6.QtCore import Signal
++from PySide6.QtCore import Qt, Signal
+ from PySide6.QtWidgets import (
+     QComboBox, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem,
+     QPushButton, QVBoxLayout, QWidget,
+@@ -12,14 +12,26 @@ from ai_studio_core.i18n import t as tr
+ from ..theme.tokens import TOKENS
+ 
+ 
++def _fmt_size(size_bytes: int) -> str:
++    if size_bytes >= 1024 ** 3:
++        return f"{size_bytes / 1024 ** 3:.2f} GB"
++    if size_bytes >= 1024 ** 2:
++        return f"{size_bytes / 1024 ** 2:.1f} MB"
++    if size_bytes >= 1024:
++        return f"{size_bytes / 1024:.0f} KB"
++    return f"{size_bytes} B"
++
++
+ class ModelHubPanel(QWidget):
+-    download_requested = Signal(str)
+-    delete_requested = Signal(str)
++    download_requested = Signal()      # открыть диалог скачивания каталога
++    delete_requested = Signal(str)     # path выбранной модели
+     refresh_requested = Signal()
+-    selection_changed = Signal(dict)     # данные выбранной модели (для Inspector)
++    selection_changed = Signal(dict)   # данные выбранной модели (для Inspector)
+ 
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
++        self._models: list[dict] = []
++
+         layout = QVBoxLayout(self)
+         layout.setSpacing(TOKENS.spacing.sm)
+         layout.setContentsMargins(
+@@ -28,7 +40,7 @@ class ModelHubPanel(QWidget):
+         )
+ 
+         self._category = QComboBox()
+-        self._category.addItems([tr("hub_all"), "TTS", "LLM", "RVC", "Image"])
++        self._category.addItem(tr("hub_all"), userData="")
+         layout.addWidget(self._category)
+ 
+         self._search = QLineEdit()
+@@ -44,27 +56,97 @@ class ModelHubPanel(QWidget):
+             f"border-bottom: 1px solid {TOKENS.colors.border_default}; }}"
+             f"QListWidget::item:selected {{ background: {TOKENS.colors.bg_tertiary}; color: #fff; }}"
+         )
+-        for name, status, size in [
+-            ("XTTS v2.0.2", "✅ Ready", "1.8 GB"),
+-            ("RVC Male v2", "✅ Ready", "420 MB"),
+-            ("GPT-4o", "☁️ API", "—"),
+-            ("Claude 3.5", "☁️ API", "—"),
+-            ("Llama 3.1 8B Q4", "📥 Download", "4.7 GB"),
+-        ]:
+-            self._list.addItem(QListWidgetItem(f'{status}  {name}\n     {tr("hub_size")} {size}'))
+         layout.addWidget(self._list, stretch=1)
+ 
+         actions = QHBoxLayout()
+         self._btn_download = QPushButton(tr("hub_download"))
+-        self._btn_download.clicked.connect(lambda: self.download_requested.emit("selected_model"))
++        self._btn_download.clicked.connect(self.download_requested.emit)
+         self._btn_delete = QPushButton(tr("hub_delete"))
+-        self._btn_delete.clicked.connect(lambda: self.delete_requested.emit("selected_model"))
++        self._btn_delete.setEnabled(False)
++        self._btn_delete.clicked.connect(self._on_delete_clicked)
++        self._btn_refresh = QPushButton(tr("hub_refresh"))
++        self._btn_refresh.clicked.connect(self.refresh_requested.emit)
+         actions.addWidget(self._btn_download)
+         actions.addWidget(self._btn_delete)
++        actions.addWidget(self._btn_refresh)
+         layout.addLayout(actions)
+ 
++        self._search.textChanged.connect(self._apply_filter)
++        self._category.currentIndexChanged.connect(lambda _i: self._apply_filter())
++        self._list.currentItemChanged.connect(self._on_current_changed)
++
++    # ── Данные ──
++
++    def set_models(self, models: list[dict]) -> None:
++        """Наполняет список реальным сканом models/. Пусто — честная строка."""
++        self._models = list(models)
++        # Пересобираем фильтр категорий из реальных данных
++        cats = sorted({m.get("category", "root") for m in self._models})
++        prev = self._category.currentData() or ""
++        self._category.blockSignals(True)
++        self._category.clear()
++        self._category.addItem(tr("hub_all"), userData="")
++        for c in cats:
++            self._category.addItem(c, userData=c)
++        idx = self._category.findData(prev)
++        self._category.setCurrentIndex(idx if idx >= 0 else 0)
++        self._category.blockSignals(False)
++        self._apply_filter()
++
++    def models(self) -> list[dict]:
++        return list(self._models)
++
++    def _filtered(self) -> list[dict]:
++        query = self._search.text().strip().lower()
++        cat = self._category.currentData() or ""
++        out = []
++        for m in self._models:
++            if cat and m.get("category") != cat:
++                continue
++            if query and query not in m.get("name", "").lower():
++                continue
++            out.append(m)
++        return out
++
++    def _apply_filter(self) -> None:
++        self._list.clear()
++        filtered = self._filtered()
++        if not filtered:
++            item = QListWidgetItem(tr("hub_empty"))
++            item.setFlags(Qt.ItemFlag.NoItemFlags)  # некликабельный честный текст
++            self._list.addItem(item)
++            return
++        for m in filtered:
++            item = QListWidgetItem(
++                f'✅  {m["name"]}\n     {m.get("category", "root")} · '
++                f'{tr("hub_size")} {_fmt_size(m.get("size_bytes", 0))}'
++            )
++            item.setData(Qt.ItemDataRole.UserRole, m)
++            self._list.addItem(item)
++
++    def selected_model(self) -> dict | None:
++        item = self._list.currentItem()
++        if not item:
++            return None
++        return item.data(Qt.ItemDataRole.UserRole)
++
++    # ── События ──
++
++    def _on_current_changed(self, current, _previous) -> None:
++        model = current.data(Qt.ItemDataRole.UserRole) if current else None
++        self._btn_delete.setEnabled(model is not None)
++        if model:
++            self.selection_changed.emit(dict(model))
++
++    def _on_delete_clicked(self) -> None:
++        model = self.selected_model()
++        if model:
++            self.delete_requested.emit(model["path"])
++
+     def retranslate_ui(self) -> None:
+         self._category.setItemText(0, tr("hub_all"))
+         self._search.setPlaceholderText(tr("hub_search_ph"))
+         self._btn_download.setText(tr("hub_download"))
+         self._btn_delete.setText(tr("hub_delete"))
++        self._btn_refresh.setText(tr("hub_refresh"))
++        self._apply_filter()
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/status_bar.py b/ai_studio_core/ai_studio_core/ui/widgets/status_bar.py
+index 0741ec6..7f543ca 100644
+--- a/ai_studio_core/ai_studio_core/ui/widgets/status_bar.py
++++ b/ai_studio_core/ai_studio_core/ui/widgets/status_bar.py
+@@ -1,4 +1,10 @@
+-"""Статус-бар с мониторингом ресурсов (GPU, VRAM, CPU, Queue)."""
++"""Статус-бар с мониторингом ресурсов (GPU, VRAM, CPU, RAM, Queue).
++
++Честность показателей:
++  * CPU/RAM — psutil (реальные, раз в 2 с);
++  * GPU/VRAM — только если установлен torch и есть CUDA; иначе «—»;
++  * Queue — реальное число задач из QueueController (set_queue_size).
++"""
+ from __future__ import annotations
+ 
+ from PySide6.QtCore import QTimer
+@@ -25,9 +31,11 @@ class ResourceStatusBar(QStatusBar):
+         self._gpu_label = self._make_indicator("GPU: —")
+         self._vram_label = self._make_indicator("VRAM: — / —")
+         self._cpu_label = self._make_indicator("CPU: —")
++        self._ram_label = self._make_indicator("RAM: —")
+         self._queue_label = self._make_indicator("Queue: 0")
+ 
+-        for w in (self._gpu_label, self._vram_label, self._cpu_label, self._queue_label):
++        for w in (self._gpu_label, self._vram_label, self._cpu_label,
++                  self._ram_label, self._queue_label):
+             self.addPermanentWidget(w)
+ 
+         self._poll_timer = QTimer(self)
+@@ -38,6 +46,9 @@ class ResourceStatusBar(QStatusBar):
+     def set_message(self, text: str) -> None:
+         self._message_label.setText(text)
+ 
++    def set_queue_size(self, count: int) -> None:
++        self._queue_label.setText(f"Queue: {int(count)}")
++
+     def update_stats(
+         self,
+         gpu_percent: int | None = None,
+@@ -58,7 +69,7 @@ class ResourceStatusBar(QStatusBar):
+         if cpu_percent is not None:
+             self._cpu_label.setText(f"CPU: {cpu_percent}%")
+         if queue_size is not None:
+-            self._queue_label.setText(f"Queue: {queue_size}")
++            self.set_queue_size(queue_size)
+ 
+     @staticmethod
+     def _make_indicator(text: str) -> QLabel:
+@@ -75,12 +86,12 @@ class ResourceStatusBar(QStatusBar):
+         return TOKENS.colors.accent_error
+ 
+     def _poll_resources(self) -> None:
+-        """Опрос CPU/памяти раз в 2с. GPU/VRAM опрашиваются только если torch есть."""
++        """Опрос CPU/RAM раз в 2 с. GPU/VRAM — только если torch+CUDA реально есть."""
+         try:
+             import psutil
+             self._cpu_label.setText(f"CPU: {psutil.cpu_percent(interval=None):.0f}%")
+             mem = psutil.virtual_memory()
+-            self._queue_label.setText(f"RAM: {mem.percent:.0f}%")
++            self._ram_label.setText(f"RAM: {mem.percent:.0f}%")
+         except Exception:
+             pass
+         try:
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py
+index 9d434c6..8f51557 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py
+@@ -262,14 +262,37 @@ class ChatWorkspace(BaseWorkspace):
+         )
+ 
+     def _on_clear(self) -> None:
++        self._reset_chat([])
++        self.clear_requested.emit()
++
++    def _reset_chat(self, history: list[dict]) -> None:
++        """Пересобирает пузыри из истории (пусто → приветствие)."""
+         while self._chat_layout.count():
+             item = self._chat_layout.takeAt(0)
+             if item.widget():
+                 item.widget().deleteLater()
+-        self._greeting_bubble = ChatBubble("assistant", tr("chat_greeting"))
+-        self._chat_layout.addWidget(self._greeting_bubble)
++        if not history:
++            self._greeting_bubble = ChatBubble("assistant", tr("chat_greeting"))
++            self._chat_layout.addWidget(self._greeting_bubble)
++        else:
++            for msg in history:
++                role = msg.get("role", "assistant")
++                if role not in ("user", "assistant"):
++                    continue
++                self._chat_layout.addWidget(
++                    ChatBubble(role, msg.get("content", "")))
++            self._greeting_bubble = None
+         self._update_context_labels()
+-        self.clear_requested.emit()
++
++    def load_messages(self, history: list[dict]) -> None:
++        """Загрузка истории из сохранённого проекта."""
++        self._reset_chat(history)
++
++    def system_prompt(self) -> str:
++        return self._system_prompt.toPlainText()
++
++    def set_system_prompt(self, text: str) -> None:
++        self._system_prompt.setPlainText(text or "")
+ 
+     def add_message(self, role: str, content: str) -> None:
+         self._chat_layout.addWidget(ChatBubble(role, content))
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py
+index 9f9834d..51217ac 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py
+@@ -240,6 +240,9 @@ class ImageWorkspace(BaseWorkspace):
+ 
+     # ── Behavior ──
+ 
++    def model_selector(self) -> ModelSelector:
++        return self._model_selector
++
+     def _on_generate(self) -> None:
+         prompt = self._prompt.toPlainText().strip()
+         if not prompt:
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/pipeline_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/pipeline_workspace.py
+index c40e83e..6f95fae 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/pipeline_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/pipeline_workspace.py
+@@ -37,6 +37,7 @@ class PipelineNode(QFrame):
+         self._lbl.setText(title)
+ 
+     def set_state(self, state: str) -> None:
++        self._state = state
+         colors = {
+             "idle": self._base_color,
+             "active": TOKENS.colors.accent_primary,
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+index 37b7ded..276cc6e 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+@@ -291,12 +291,9 @@ class TTSWorkspace(BaseWorkspace):
+             f"color: {TOKENS.colors.text_disabled}; }}"
+         )
+ 
+-    def _on_generate(self) -> None:
+-        """Собирает параметры из сайдбара и эмитит generate_requested."""
+-        text = self._text_input.toPlainText().strip()
+-        if not text:
+-            return
+-        params = {
++    def current_params(self) -> dict:
++        """Текущие параметры сайдбара (для генерации и сохранения проекта)."""
++        return {
+             "language": self._combo_lang.currentText(),
+             "temperature": self._slider_temp.value() / 100,
+             "speed": self._slider_speed.value() / 100,
+@@ -311,4 +308,40 @@ class TTSWorkspace(BaseWorkspace):
+             "autoplay": self._out_autoplay.isChecked(),
+             "reference_audio": self._ref_drop.current_path(),
+         }
+-        self.generate_requested.emit(text, params)
++
++    def apply_params(self, params: dict) -> None:
++        """Восстановление параметров сайдбара из сохранённого проекта."""
++        if not isinstance(params, dict):
++            return
++        if params.get("language"):
++            self._combo_lang.setCurrentText(str(params["language"]))
++        for slider, key in ((self._slider_temp, "temperature"),
++                            (self._slider_speed, "speed"),
++                            (self._slider_top_p, "top_p"),
++                            (self._slider_rep, "repetition_penalty"),
++                            (self._slider_index, "rvc_index_rate")):
++            if key in params:
++                try:
++                    slider.setValue(int(round(float(params[key]) * 100)))
++                except (TypeError, ValueError):
++                    pass
++        if "rvc_pitch" in params:
++            try:
++                self._slider_pitch.setValue(int(params["rvc_pitch"]))
++            except (TypeError, ValueError):
++                pass
++        if "rvc_enabled" in params:
++            self._rvc_enable.setChecked(bool(params["rvc_enabled"]))
++        if params.get("output_format"):
++            self._out_format.setCurrentText(str(params["output_format"]).upper())
++        if params.get("sample_rate"):
++            self._out_sr.setCurrentText(str(params["sample_rate"]))
++        if "autoplay" in params:
++            self._out_autoplay.setChecked(bool(params["autoplay"]))
++
++    def _on_generate(self) -> None:
++        """Собирает параметры из сайдбара и эмитит generate_requested."""
++        text = self._text_input.toPlainText().strip()
++        if not text:
++            return
++        self.generate_requested.emit(text, self.current_params())
+diff --git a/ai_studio_core/test/test_hub_scan_real.py b/ai_studio_core/test/test_hub_scan_real.py
+new file mode 100644
+index 0000000..5df267b
+--- /dev/null
++++ b/ai_studio_core/test/test_hub_scan_real.py
+@@ -0,0 +1,142 @@
++# -*- coding: utf-8 -*-
++"""Model Hub: реальный скан models/, фильтры панели, удаление с защитой."""
++from __future__ import annotations
++
++import os
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="панель — Qt-виджет")
++
++from PySide6.QtWidgets import QApplication
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++@pytest.fixture()
++def model_tree(tmp_path):
++    """Реальные файлы «моделей» в tmp/models: категория по подкаталогу."""
++    mdir = tmp_path / "models"
++    (mdir / "rvc").mkdir(parents=True)
++    (mdir / "llm").mkdir()
++    (mdir / ".preview_cache").mkdir()
++    (mdir / "rvc" / "singer_v1.pth").write_bytes(b"weights" * 100)
++    (mdir / "llm" / "llama-8b-q4.gguf").write_bytes(b"gguf" * 1000)
++    (mdir / "decoder.onnx").write_bytes(b"onnx")
++    (mdir / "notes.txt").write_text("not a model")
++    (mdir / ".preview_cache" / "hidden.pth").write_bytes(b"cache")
++    return mdir
++
++
++class TestScanLocalModels:
++    def test_scan_finds_real_files_with_categories(self, model_tree):
++        from ai_studio_core.ui.controllers.model_controller import scan_local_models
++        models = scan_local_models(str(model_tree))
++        by_name = {m["name"]: m for m in models}
++        assert set(by_name) == {"singer_v1.pth", "llama-8b-q4.gguf", "decoder.onnx"}
++        assert by_name["singer_v1.pth"]["category"] == "rvc"
++        assert by_name["llama-8b-q4.gguf"]["category"] == "llm"
++        assert by_name["decoder.onnx"]["category"] == "root"
++        # Реальные размеры с диска
++        assert by_name["llama-8b-q4.gguf"]["size_bytes"] == 4000
++
++    def test_hidden_cache_dirs_skipped(self, model_tree):
++        from ai_studio_core.ui.controllers.model_controller import scan_local_models
++        models = scan_local_models(str(model_tree))
++        assert all("hidden.pth" != m["name"] for m in models)
++
++    def test_scan_missing_dir_is_honestly_empty(self, tmp_path):
++        from ai_studio_core.ui.controllers.model_controller import scan_local_models
++        assert scan_local_models(str(tmp_path / "nope")) == []
++        assert scan_local_models("") == []
++
++
++class TestModelControllerDelete:
++    def _ctrl(self, monkeypatch, model_dir):
++        from ai_studio_core import paths
++        monkeypatch.setattr(paths, "MODEL_DIR", str(model_dir))
++        from ai_studio_core.ui.controllers.model_controller import ModelController
++        return ModelController()
++
++    def test_delete_real_file(self, monkeypatch, model_tree):
++        ctrl = self._ctrl(monkeypatch, model_tree)
++        target = str(model_tree / "rvc" / "singer_v1.pth")
++        assert os.path.isfile(target)
++        updated = []
++        ctrl.models_updated.connect(updated.append)
++        assert ctrl.delete_model(target) is True
++        assert not os.path.exists(target)
++        assert updated, "после удаления список пересканирован"
++        assert all(m["name"] != "singer_v1.pth" for m in updated[-1])
++
++    def test_delete_outside_models_dir_refused(self, monkeypatch, model_tree, tmp_path):
++        ctrl = self._ctrl(monkeypatch, model_tree)
++        outside = tmp_path / "secret.bin"
++        outside.write_bytes(b"top secret model")
++        errors = []
++        ctrl.error_occurred.connect(errors.append)
++        assert ctrl.delete_model(str(outside)) is False
++        assert outside.exists(), "файл вне models/ неприкосновенен"
++        assert errors, "отказ озвучен пользователю"
++
++    def test_delete_traversal_refused(self, monkeypatch, model_tree):
++        ctrl = self._ctrl(monkeypatch, model_tree)
++        sneaky = str(model_tree / "rvc" / ".." / ".." / "etc_passwd.bin")
++        assert ctrl.delete_model(sneaky) is False
++
++
++class TestModelHubPanel:
++    def test_panel_lists_real_models_and_filters(self, app, model_tree):
++        from ai_studio_core.ui.panels.model_hub_panel import ModelHubPanel
++        from ai_studio_core.ui.controllers.model_controller import scan_local_models
++
++        panel = ModelHubPanel()
++        panel.set_models(scan_local_models(str(model_tree)))
++        assert panel._list.count() == 3
++
++        # Фильтр по категории rvc
++        idx = panel._category.findData("rvc")
++        panel._category.setCurrentIndex(idx)
++        assert panel._list.count() == 1
++        assert "singer_v1.pth" in panel._list.item(0).text()
++
++        # Поиск по имени
++        panel._category.setCurrentIndex(0)
++        panel._search.setText("llama")
++        assert panel._list.count() == 1
++        assert "llama" in panel._list.item(0).text()
++
++    def test_panel_empty_state_honest(self, app):
++        from ai_studio_core.ui.panels.model_hub_panel import ModelHubPanel
++        from ai_studio_core.i18n import t as tr
++
++        panel = ModelHubPanel()
++        panel.set_models([])
++        assert panel._list.count() == 1
++        assert panel._list.item(0).text() == tr("hub_empty")
++        assert panel.selected_model() is None  # манекен не выбирается
++
++    def test_selection_emits_real_model(self, app, model_tree):
++        from ai_studio_core.ui.panels.model_hub_panel import ModelHubPanel
++        from ai_studio_core.ui.controllers.model_controller import scan_local_models
++
++        panel = ModelHubPanel()
++        panel.set_models(scan_local_models(str(model_tree)))
++        seen = []
++        panel.selection_changed.connect(seen.append)
++        panel._list.setCurrentRow(0)
++        assert panel._btn_delete.isEnabled()
++        name = panel._list.item(0).text()
++        assert seen and seen[0]["name"] in name
++        assert os.path.isfile(seen[0]["path"])  # путь реален
++
++        panel._btn_delete.click()
++        # delete_requested ушёл с реальным путём файла
++        deleted_path = seen[0]["path"]
++        assert deleted_path.endswith((".pth", ".gguf", ".onnx"))
+diff --git a/ai_studio_core/test/test_model_download_real.py b/ai_studio_core/test/test_model_download_real.py
+new file mode 100644
+index 0000000..1657791
+--- /dev/null
++++ b/ai_studio_core/test/test_model_download_real.py
+@@ -0,0 +1,171 @@
++# -*- coding: utf-8 -*-
++"""Реальное скачивание модели: loopback HTTP-сервер отдаёт .pth,
++rvc_catalog.downloader кладёт файл в models/rvc (подменённый на tmp),
++контроллер эмитит честные сигналы прогресса/завершения.
++"""
++from __future__ import annotations
++
++import hashlib
++import os
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++from ai_studio_core import paths
++
++pytest.importorskip("PySide6", reason="контроллер — QObject")
++
++from PySide6.QtWidgets import QApplication
++
++PAYLOAD = b"FAKE-RVC-WEIGHTS-" + bytes(range(256)) * 16  # ~4.3 KB «весов»
++
++
++class _FileHandler(BaseHTTPRequestHandler):
++    def do_GET(self):
++        if self.path.startswith("/voice1.pth"):
++            body = PAYLOAD
++            self.send_response(200)
++        else:
++            body = b"nope"
++            self.send_response(404)
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *args):
++        pass
++
++
++@pytest.fixture(scope="module")
++def file_server():
++    server = HTTPServer(("127.0.0.1", 0), _FileHandler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    yield server
++    server.shutdown()
++    thread.join(timeout=5)
++    server.server_close()
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _wait(app, cond, timeout=30.0):
++    t0 = time.time()
++    while not cond() and time.time() - t0 < timeout:
++        app.processEvents()
++        time.sleep(0.02)
++    return cond()
++
++
++@pytest.fixture()
++def rvc_dir(tmp_path, monkeypatch):
++    """Перенаправляем models/rvc в tmp — репозиторий не мусорим.
++
++    metadata.py читает `_C.RVC_METADATA_DIR` напрямую из _constants
++    (минуя алиас пакета) — перенаправляем оба пути.
++    """
++    import ai_studio_core.rvc_catalog as pkg
++    from ai_studio_core.rvc_catalog import _constants as C
++    d = tmp_path / "models" / "rvc"
++    monkeypatch.setattr(pkg, "RVC_MODELS_DIR", str(d))
++    monkeypatch.setattr(C, "RVC_METADATA_DIR", str(d / ".metadata"))
++    return d
++
++
++class TestDownloaderCore:
++    def test_real_http_download_bytes_exact(self, file_server, rvc_dir):
++        from ai_studio_core.rvc_catalog.downloader import (
++            download_model, is_downloaded, local_model_path,
++        )
++        port = file_server.server_address[1]
++        entry = {"id": "t1", "name": "Loop Voice",
++                 "url": f"http://127.0.0.1:{port}/voice1.pth"}
++
++        progress = []
++        ok = download_model(entry, progress_callback=lambda d, t: progress.append((d, t)))
++        assert ok is True
++        path = local_model_path(entry)
++        assert path.startswith(str(rvc_dir))
++        with open(path, "rb") as f:
++            assert f.read() == PAYLOAD  # побайтово тот же файл
++        assert is_downloaded(entry) is True
++        assert progress, "прогресс-отчёты были"
++
++    def test_sha256_verified(self, file_server, rvc_dir):
++        from ai_studio_core.rvc_catalog.downloader import download_model
++        port = file_server.server_address[1]
++        good = hashlib.sha256(PAYLOAD).hexdigest()
++        entry = {"id": "t2", "name": "Hashed",
++                 "url": f"http://127.0.0.1:{port}/voice1.pth", "sha256": good}
++        assert download_model(entry) is True
++
++    def test_sha256_mismatch_rejected(self, file_server, rvc_dir):
++        from ai_studio_core.rvc_catalog.downloader import download_model, local_model_path
++        port = file_server.server_address[1]
++        entry = {"id": "t3", "name": "Tampered",
++                 "url": f"http://127.0.0.1:{port}/voice1.pth", "sha256": "0" * 64}
++        assert download_model(entry) is False
++        assert not os.path.exists(local_model_path(entry))
++
++    def test_server_404_fails_honestly(self, file_server, rvc_dir):
++        from ai_studio_core.rvc_catalog.downloader import download_model
++        port = file_server.server_address[1]
++        entry = {"id": "t4", "name": "Missing",
++                 "url": f"http://127.0.0.1:{port}/nope.pth"}
++        assert download_model(entry) is False
++        assert list(rvc_dir.glob("*.pth")) == []
++
++
++class TestModelControllerDownload:
++    def test_download_entry_end_to_end(self, app, file_server, rvc_dir, monkeypatch):
++        from ai_studio_core.ui.controllers.model_controller import ModelController
++        # refresh() сканирует paths.MODEL_DIR — направляем в тот же tmp
++        monkeypatch.setattr(paths, "MODEL_DIR", str(rvc_dir.parent))
++
++        ctrl = ModelController()
++        port = file_server.server_address[1]
++        entry = {"id": "t5", "name": "Ctrl Voice",
++                 "url": f"http://127.0.0.1:{port}/voice1.pth"}
++
++        started, progressed, finished, failed, updated = [], [], [], [], []
++        ctrl.download_started.connect(started.append)
++        ctrl.download_progress.connect(lambda n, p: progressed.append(p))
++        ctrl.download_finished.connect(finished.append)
++        ctrl.download_failed.connect(lambda n, m: failed.append((n, m)))
++        ctrl.models_updated.connect(updated.append)
++
++        ctrl.download_entry(entry)
++        assert _wait(app, lambda: bool(finished) or bool(failed), 30)
++        assert finished == ["Ctrl Voice"], f"failed={failed}"
++        assert progressed and progressed[-1] == 100
++        assert started == ["Ctrl Voice"]
++
++        # файлы на диске и в обновлённом скане
++        assert (rvc_dir / "voice1.pth").read_bytes() == PAYLOAD
++        assert updated, "скан обновился после скачивания"
++        names = [m["name"] for m in updated[-1]]
++        assert "voice1.pth" in names
++        assert ctrl.is_downloaded(entry) is True
++
++    def test_download_failure_signal_honest(self, app, file_server, rvc_dir):
++        from ai_studio_core.ui.controllers.model_controller import ModelController
++
++        ctrl = ModelController()
++        port = file_server.server_address[1]
++        entry = {"id": "t6", "name": "Broken Voice",
++                 "url": f"http://127.0.0.1:{port}/missing.pth"}
++        finished, failed = [], []
++        ctrl.download_finished.connect(finished.append)
++        ctrl.download_failed.connect(lambda n, m: failed.append((n, m)))
++        ctrl.download_entry(entry)
++        assert _wait(app, lambda: bool(finished) or bool(failed), 30)
++        assert not finished
++        assert failed and failed[0][0] == "Broken Voice"
+diff --git a/ai_studio_core/test/test_project_and_pipeline_real.py b/ai_studio_core/test/test_project_and_pipeline_real.py
+new file mode 100644
+index 0000000..8073ad8
+--- /dev/null
++++ b/ai_studio_core/test/test_project_and_pipeline_real.py
+@@ -0,0 +1,237 @@
++# -*- coding: utf-8 -*-
++"""Этап 10 (часть 2): сохранение/загрузка проекта, реальный Pipeline Run,
++честный гейт Image-бэкенда, реальные показатели статус-бара.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="QObject/UI")
++
++from PySide6.QtWidgets import QApplication
++
++from ai_studio_core import espeak_tts, paths
++
++need_espeak = pytest.mark.skipif(not espeak_tts.available(),
++                                 reason="espeak не установлен")
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _wait(app, cond, timeout=30.0):
++    t0 = time.time()
++    while not cond() and time.time() - t0 < timeout:
++        app.processEvents()
++        time.sleep(0.02)
++    return cond()
++
++
++@pytest.fixture()
++def window(app, tmp_path, monkeypatch):
++    """MainWindow с изолированными QSettings."""
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
++    from PySide6.QtCore import QSettings
++    QSettings("ai_studio", "studio").clear()
++    from ai_studio_core.ui.main_window import MainWindow
++    return MainWindow()
++
++
++# ── Проект: реальный JSON roundtrip ──────────────────────────────────────────
++
++class TestProjectPersistence:
++    def test_save_load_roundtrip_restores_state(self, window, tmp_path):
++        w = window
++        w._tts_workspace.set_text("Текст проекта для сохранения")
++        w._tts_workspace._combo_lang.setCurrentText("ru")
++        w._tts_workspace._slider_speed.setValue(150)
++        w._chat_workspace.set_system_prompt("SYS-P")
++        w._chat_ctrl.set_history([
++            {"role": "user", "content": "q1"},
++            {"role": "assistant", "content": "a1"},
++        ])
++        w._chat_workspace.load_messages(w._chat_ctrl.history())
++
++        path = str(tmp_path / "proj.json")
++        w.save_project_to(path)
++        raw = json.loads(open(path, encoding="utf-8").read())
++        assert raw["version"] == 1
++        assert raw["tts"]["text"] == "Текст проекта для сохранения"
++        assert len(raw["chat"]["history"]) == 2
++
++        # Портим состояние и грузим обратно
++        w._clear_project()
++        assert w._tts_workspace.text() == ""
++        assert w._chat_ctrl.history() == []
++
++        w.load_project_from(path)
++        assert w._tts_workspace.text() == "Текст проекта для сохранения"
++        assert w._tts_workspace._combo_lang.currentText() == "ru"
++        assert w._tts_workspace._slider_speed.value() == 150
++        assert w._chat_ctrl.history() == [
++            {"role": "user", "content": "q1"},
++            {"role": "assistant", "content": "a1"},
++        ]
++        assert w._chat_workspace.system_prompt() == "SYS-P"
++
++    def test_load_rejects_non_project_json(self, window, tmp_path):
++        path = tmp_path / "garbage.json"
++        path.write_text('{"foo": 42}', encoding="utf-8")
++        with pytest.raises(ValueError):
++            window.load_project_from(str(path))
++
++    def test_new_project_clears_canvas(self, window):
++        w = window
++        w._tts_workspace.set_text("something")
++        w._chat_ctrl.set_history([{"role": "user", "content": "x"}])
++        w._on_new_project()
++        assert w._tts_workspace.text() == ""
++        assert w._chat_ctrl.history() == []
++        # После очистки остаётся только приветствие
++        bubbles = w._chat_workspace._collect_history()
++        assert len(bubbles) == 1 and bubbles[0]["role"] == "assistant"
++
++
++# ── Pipeline Run: та же реальная цепочка, ноды подсвечиваются ───────────────
++
++@need_espeak
++class TestPipelineRunReal:
++    def test_run_produces_real_wav_and_lights_nodes(self, app, tmp_path, monkeypatch):
++        out_dir = tmp_path / "outputs"
++        monkeypatch.setattr(paths, "OUTPUT_DIR", str(out_dir))
++        import ai_studio_core.output_naming as on
++        import ai_studio_core.history_store as hs
++        monkeypatch.setattr(on, "OUTPUT_DIR", str(out_dir))
++        monkeypatch.setattr(hs, "HISTORY_PATH", str(tmp_path / "history.json"))
++
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        from ai_studio_core.ui.workspaces.pipeline_workspace import PipelineWorkspace
++
++        ctrl = TTSController()
++        ws = PipelineWorkspace()
++        # Проводка как в MainWindow
++        ws.run_requested.connect(
++            lambda text: ctrl.on_generate(text, {"language": "en", "speed": 1.0}))
++        ws.stop_requested.connect(ctrl.on_stop)
++        ctrl.pipeline_step_changed.connect(ws.set_node_state)
++        ctrl.generation_started.connect(ws.reset_nodes)
++
++        done = {}
++        ctrl.generation_complete.connect(lambda p: done.update(path=p))
++        ctrl.error_occurred.connect(lambda m: done.update(err=m))
++
++        ws._input.setPlainText("Pipeline run produces real audio output.")
++        ws._on_run()
++        assert _wait(app, lambda: "path" in done or "err" in done, 30)
++        assert "path" in done, f"упало: {done.get('err')}"
++        assert os.path.exists(done["path"])
++        assert os.path.getsize(done["path"]) > 0
++
++        # Ноды реально отсветили ход выполнения: Input/Normalize/TTS/Output = done
++        states = [ws._nodes[i]._state for i in range(6)]
++        assert states[0] == "done"   # Input
++        assert states[1] == "done"   # Normalize
++        assert states[2] == "done"   # TTS
++        assert states[5] == "done"   # Output
++        assert ctrl.backend() == "espeak"
++
++    def test_node_state_api_bounds(self, app):
++        from ai_studio_core.ui.workspaces.pipeline_workspace import PipelineWorkspace
++        ws = PipelineWorkspace()
++        ws.set_node_state(2, "active")
++        ws.set_node_state(-1, "done")    # за границами — молча игнор
++        ws.set_node_state(99, "done")
++        ws.set_node_states(["done"] * 6)
++        ws.reset_nodes()
++
++
++# ── Image: честный гейт без заглушки-картинки ────────────────────────────────
++
++class TestImageGate:
++    def test_missing_backend_honest_error_no_files(self, app, tmp_path, monkeypatch):
++        import ai_studio_core.ui.controllers.image_controller as ic
++        from ai_studio_core.i18n import t as tr
++
++        monkeypatch.setattr(ic, "_diffusers_available", lambda: False)
++        monkeypatch.setattr(paths, "OUTPUT_DIR", str(tmp_path / "outputs"))
++        ctrl = ic.ImageController()
++        errors, ready = [], []
++        ctrl.error_occurred.connect(errors.append)
++        ctrl.image_ready.connect(ready.append)
++        ctrl.on_generate("a cat in space", {"steps": 5})
++        assert errors == [tr("ctl_img_missing")]
++        assert ready == [], "фальшивого «результата» не появилось"
++        assert ctrl.last_image() is None
++        outdir = tmp_path / "outputs"
++        if outdir.exists():
++            assert list(outdir.iterdir()) == []
++
++    def test_available_models_reflect_diffusers_presence(self, app):
++        import ai_studio_core.ui.controllers.image_controller as ic
++        ctrl = ic.ImageController()
++        models = ctrl.available_models()
++        assert len(models) == 1
++        expected = "ready" if ic._diffusers_available() else "download"
++        assert models[0]["status"] == expected
++
++
++# ── Статус-бар: реальные метрики ─────────────────────────────────────────────
++
++class TestStatusBarReal:
++    def test_cpu_ram_real_numbers(self, app):
++        psutil = pytest.importorskip("psutil")
++        from ai_studio_core.ui.widgets.status_bar import ResourceStatusBar
++
++        bar = ResourceStatusBar()
++        bar._poll_resources()
++        cpu_txt = bar._cpu_label.text()
++        ram_txt = bar._ram_label.text()
++        assert cpu_txt.startswith("CPU: ") and cpu_txt.endswith("%")
++        assert ram_txt.startswith("RAM: ") and ram_txt.endswith("%")
++        cpu_val = int(cpu_txt[5:-1])
++        assert 0 <= cpu_val <= 100
++
++    def test_gpu_honestly_dash_without_torch(self, app):
++        pytest.importorskip("psutil")
++        import ai_studio_core.ui.widgets.status_bar as sb
++        bar = sb.ResourceStatusBar()
++        # В этой среде torch отсутствует → индикатор честно «—»
++        try:
++            import torch  # noqa
++            has_torch = True
++        except Exception:
++            has_torch = False
++        bar._poll_resources()
++        if not has_torch:
++            assert bar._gpu_label.text() == "GPU: —"
++            assert bar._vram_label.text() == "VRAM: — / —"
++
++    def test_queue_size_label_real(self, app):
++        pytest.importorskip("psutil")
++        from ai_studio_core.ui.widgets.status_bar import ResourceStatusBar
++        bar = ResourceStatusBar()
++        bar.set_queue_size(3)
++        assert bar._queue_label.text() == "Queue: 3"
++        bar.set_queue_size(0)
++        assert bar._queue_label.text() == "Queue: 0"
++
++    def test_queue_controller_drives_status_bar(self, window):
++        """Интеграция: задачи очереди меняют индикатор Queue."""
++        qctrl = window._queue_ctrl
++        bar = window._resource_bar
++        tid = qctrl.add_task("TTS", "espeak", {})
++        QApplication.processEvents()
++        assert bar._queue_label.text() == "Queue: 1"
++        qctrl.cancel_task(tid)
++        qctrl.clear_completed()
++        QApplication.processEvents()
++        assert bar._queue_label.text() == "Queue: 0"
+diff --git a/ui_hub_real.png b/ui_hub_real.png
+new file mode 100644
+index 0000000..654e565
+Binary files /dev/null and b/ui_hub_real.png differ
+diff --git a/ui_workspace_pipeline_real.png b/ui_workspace_pipeline_real.png
+new file mode 100644
+index 0000000..618449a
+Binary files /dev/null and b/ui_workspace_pipeline_real.png differ

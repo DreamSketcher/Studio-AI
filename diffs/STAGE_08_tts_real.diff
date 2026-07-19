@@ -1,0 +1,2241 @@
+commit 33baea667a5c5cf036c57cf7ccbcbad92e834222
+Author: arena-agent <agent@local>
+Date:   Sat Jul 18 21:37:45 2026 +0000
+
+    Stage 08 — real TTS pipeline (espeak backend), waveform, history, queue, export
+
+diff --git a/AUDIT_08_tts_real.md b/AUDIT_08_tts_real.md
+new file mode 100644
+index 0000000..1a95d9d
+--- /dev/null
++++ b/AUDIT_08_tts_real.md
+@@ -0,0 +1,81 @@
++# Отчёт №8 — Реальный TTS-пайплайн: espeak-бэкенд, волна, история, очередь, экспорт
++
++**Дата:** 2026-07-18
++**Этап:** Замена демо-имплементации TTS на рабочий синтез. Без заглушек
++«насколько позволяет окружение»: Coqui XTTS требует torch+TTS (не установлены
++в среде) — поэтому добавлен честный второй бэкенд espeak-ng, дающий
++**настоящий синтезированный WAV**.
++
++---
++
++## 1. Что было заглушкой → чем стало
++
++| Было | Стало |
++|---|---|
++| `time.sleep(0.4)` и строковый путь `outputs/demo_output.wav` без файла | Реальный синтез каждого чанка бэкендом + склейка WAV + файл на диске |
++| Виджет волны — статичные символы `▁▂▃▅▇` | Реальные пики амплитуды из WAV, QPainter-рендер, длительность, seek, воспроизведение (где есть аудио-бэкенд) |
++| История — 4 вшитых демо-записи | Скан реального каталога `outputs/`, дата/размер с диска, выбор → Inspector |
++| Очередь — 2 вшитые демо-задачи | Пустая очередь; реальные задачи жизненного цикла генерации (running→done/error/cancelled) |
++| Export — toast «заглушка» | Конвертация/копия последнего результата через pydub+ffmpeg в выбранный файл |
++| RVC включён → молча игнорировался | Честный гейт: ошибка «RVC backend is not installed» ДО старта синтеза |
++
++## 2. Новые компоненты
++
++### `ai_studio_core/espeak_tts.py` (ядро)
++- `find_espeak()/available()` — поиск `espeak-ng`/`espeak`.
++- `synthesize(text, out_path, language, speed)` → реальный WAV 22050 Гц mono 16-bit + факты (duration/frames/rate).
++- `resolve_voice` — автоопределение ru/en по кириллице; `wpm_from_speed` — скорость UI→WPM.
++- Отказ бэкенда → `RuntimeError`, **файл-пустышка не создаётся**.
++
++### `TTSController` — переписан
++- Автовыбор бэкенда: `coqui` (если torch+TTS) → `espeak` → честная ошибка `ctl_tts_missing`.
++- Цепочка: normalize → chunk → синтез по чанкам → склейка `wave` (без внешних зависимостей, 150 мс паузы) → имя через `output_naming` → конвертация формата (pydub+ffmpeg) → `save_history` → сигналы.
++- Coqui-путь реализован полностью (XTTS v2 требует reference-аудио — без него честная ошибка с инструкцией), в этой среде не тестируется (нет torch) — выбор бэкенда автоматический.
++- espeak честно логирует: reference audio игнорируется (клонирование голоса — только Coqui).
++- Интеграция с очередью через `attach_queue(qc)`; прогресс/статусы реальные.
++- `export_last(target)` — копия/конвертация с валидацией.
++
++### `HistoryPanel` — переписана
++`scan_outputs(OUTPUT_DIR)`: реальные файлы (`wav/mp3/flac/ogg`), сортировка по mtime, имя/дата/размер, поиск, выбор → `item_selected(path)` → Inspector показывает Size/Path, двойной клик — тот же сигнал. Пустое состояние — честный текст, не манекены.
++
++### `MainWindow`
++- `_on_tts_done`: волна из реального файла, Export активна, autoplay (если включён в сайдбаре), `history.refresh()`.
++- `_on_export`: диалог сохранения → `export_last` → toast/лог; «нечего экспортировать» — честное предупреждение.
++
++## 3. Тесты (новые, 46 шт.)
++
++**`test_espeak_backend.py`** (15): обнаружение бинарника; автоопределение языка;
++границы WPM; **реальный синтез EN/RU** (файл, 22050 Гц, >1000 сэмплов,
++размер ≥ полусекунды речи — анти-пустышка); перезапись в явный путь;
++пустой текст → ValueError; отсутствие бинарника → RuntimeError без файла.
++
++**`test_waveform_real.py`** (10): пики синуса (форма, нормировка), ступенька
++амплитуды, zero-length → ValueError, пики реальной речи (есть паузы),
++длительность, формат времени, виджет offscreen (пики/время/путь),
++кнопка play честно отключена без мультимедиа-бэкенда.
++
++**`test_tts_flow_real.py`** (15): бэкенд здесь = espeak; полный поток с
++реальным WAV (>20 KB, 22050 Гц); pipeline-steps доходят до Output;
++мульти-чанк склейка (длительность >3 с); вывод mp3 через ffmpeg real;
++запись в history.json; RVC-гейт (ошибка, генерации НЕТ); отказ при
++недоступном бэкенде; очередь стартует пустой (анти-демо), жизненный цикл
++задачи done/100, cancel, clear; экспорт-копия байт-в-байт, экспорт без
++генерации → RuntimeError, цель без расширения → ValueError;
++отмена → задача cancelled.
++
++**`test_history_real.py`** (6): скан только аудио sorted desc; нет каталога → [];
++пусто → честный текст; выбор → реальный путь; поиск-фильтр; refresh подхватывает новый файл.
++
++## 4. Проверка
++
++| Проверка | Результат |
++|---|---|
++| `pytest test/` | ✅ **558 passed** (512 + 46 новых) за ~3 c |
++| `lint-imports` | ✅ KEPT, 0 broken |
++| Живой прогон GUI (offscreen) | ✅ реальный WAV 137 758 B, очередь done/100, история/Inspector показывают файл, волна отрисована |
++| Скриншот | ✅ `ui_workspace_tts_real.png` |
++
++> Torch-зависимые тесты (`test_qc`, `test_task_manager`, `test_tts_utils`)
++> по-прежнему вне прогона — в среде нет torch; к правкам отношения не имеют.
++
++Скрин/дифф этапа: `ui_workspace_tts_real.png`, `STAGE_08_tts_real.diff`.
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index d10d71b..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/ai_conductor.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/ai_conductor.cpython-313.pyc
+deleted file mode 100644
+index 9494c1f..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/ai_conductor.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/atomic_write.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/atomic_write.cpython-313.pyc
+deleted file mode 100644
+index 60c7a79..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/atomic_write.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/chunker.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/chunker.cpython-313.pyc
+deleted file mode 100644
+index 4844fb6..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/chunker.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/de_esser.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/de_esser.cpython-313.pyc
+deleted file mode 100644
+index b3e677e..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/de_esser.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/env_setup.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/env_setup.cpython-313.pyc
+deleted file mode 100644
+index 8aeab16..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/env_setup.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/gpt_client.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/gpt_client.cpython-313.pyc
+deleted file mode 100644
+index 77de1b2..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/gpt_client.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/history_store.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/history_store.cpython-313.pyc
+deleted file mode 100644
+index b923324..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/history_store.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/i18n.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/i18n.cpython-313.pyc
+deleted file mode 100644
+index a8d427b..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/i18n.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/local_llm_client.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/local_llm_client.cpython-313.pyc
+deleted file mode 100644
+index fc48fc6..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/local_llm_client.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/logging_utils.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/logging_utils.cpython-313.pyc
+deleted file mode 100644
+index f3cebe8..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/logging_utils.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/normalizer.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/normalizer.cpython-313.pyc
+deleted file mode 100644
+index 4a81a36..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/normalizer.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/output_naming.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/output_naming.cpython-313.pyc
+deleted file mode 100644
+index fda711b..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/output_naming.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/paths.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/paths.cpython-313.pyc
+deleted file mode 100644
+index 7556c08..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/paths.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/prosody_layer.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/prosody_layer.cpython-313.pyc
+deleted file mode 100644
+index 4782502..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/prosody_layer.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/reference_processor.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/reference_processor.cpython-313.pyc
+deleted file mode 100644
+index f69ee42..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/reference_processor.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/release_hashing.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/release_hashing.cpython-313.pyc
+deleted file mode 100644
+index 161bce1..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/release_hashing.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/rvc_pipeline.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/rvc_pipeline.cpython-313.pyc
+deleted file mode 100644
+index 01d8cdc..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/rvc_pipeline.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/secret_store.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/secret_store.cpython-313.pyc
+deleted file mode 100644
+index ad0cb6e..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/secret_store.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/settings_store.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/settings_store.cpython-313.pyc
+deleted file mode 100644
+index 92cb22f..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/settings_store.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/smart_pauses.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/smart_pauses.cpython-313.pyc
+deleted file mode 100644
+index 55311f2..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/smart_pauses.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/text_utils.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/text_utils.cpython-313.pyc
+deleted file mode 100644
+index fd0a074..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/text_utils.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/update_signing.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/update_signing.cpython-313.pyc
+deleted file mode 100644
+index 3d775a1..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/update_signing.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/updater.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/updater.cpython-313.pyc
+deleted file mode 100644
+index efae465..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/updater.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/validation.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/validation.cpython-313.pyc
+deleted file mode 100644
+index bf82981..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/validation.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/voice_manager.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/voice_manager.cpython-313.pyc
+deleted file mode 100644
+index 086aca8..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/voice_manager.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/word_replacer.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/word_replacer.cpython-313.pyc
+deleted file mode 100644
+index b77ca5b..0000000
+Binary files a/ai_studio_core/ai_studio_core/__pycache__/word_replacer.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/env_core/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/env_core/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index b459094..0000000
+Binary files a/ai_studio_core/ai_studio_core/env_core/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/env_core/__pycache__/cpu_gpu.cpython-313.pyc b/ai_studio_core/ai_studio_core/env_core/__pycache__/cpu_gpu.cpython-313.pyc
+deleted file mode 100644
+index ca4784b..0000000
+Binary files a/ai_studio_core/ai_studio_core/env_core/__pycache__/cpu_gpu.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/env_core/__pycache__/diagnostics.cpython-313.pyc b/ai_studio_core/ai_studio_core/env_core/__pycache__/diagnostics.cpython-313.pyc
+deleted file mode 100644
+index 78ef262..0000000
+Binary files a/ai_studio_core/ai_studio_core/env_core/__pycache__/diagnostics.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/env_core/__pycache__/llama_setup.cpython-313.pyc b/ai_studio_core/ai_studio_core/env_core/__pycache__/llama_setup.cpython-313.pyc
+deleted file mode 100644
+index b7247ce..0000000
+Binary files a/ai_studio_core/ai_studio_core/env_core/__pycache__/llama_setup.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/env_core/__pycache__/rvc_setup.cpython-313.pyc b/ai_studio_core/ai_studio_core/env_core/__pycache__/rvc_setup.cpython-313.pyc
+deleted file mode 100644
+index c88d251..0000000
+Binary files a/ai_studio_core/ai_studio_core/env_core/__pycache__/rvc_setup.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/env_core/__pycache__/torch_setup.cpython-313.pyc b/ai_studio_core/ai_studio_core/env_core/__pycache__/torch_setup.cpython-313.pyc
+deleted file mode 100644
+index eb78b0a..0000000
+Binary files a/ai_studio_core/ai_studio_core/env_core/__pycache__/torch_setup.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/espeak_tts.py b/ai_studio_core/ai_studio_core/espeak_tts.py
+new file mode 100644
+index 0000000..4497362
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/espeak_tts.py
+@@ -0,0 +1,123 @@
++# -*- coding: utf-8 -*-
++"""ai_studio_core/espeak_tts.py — реальный TTS-бэкенд через espeak/espeak-ng.
++
++Используется контроллером TTS как основной локальный синтезатор в сборках
++без Coqui XTTS (torch/TTS). Синтезирует настоящий WAV (16-bit mono, 22050 Hz)
++через системный бинарник — без заглушек и «демо-файлов».
++
++Если бинарник не найден — available() == False, и вызывающий код обязан
++честно сообщить пользователю (а не подсовывать подделку).
++"""
++from __future__ import annotations
++
++import os
++import re
++import shutil
++import subprocess
++import tempfile
++import wave
++from dataclasses import dataclass
++
++BASE_WPM = 175          # скорость речи espeak по умолчанию
++CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
++
++
++@dataclass
++class SynthesisResult:
++    path: str
++    duration_sec: float
++    sample_rate: int
++    frames: int
++
++
++def find_espeak() -> str | None:
++    """Возвращает путь к espeak-ng/espeak или None."""
++    for name in ("espeak-ng", "espeak"):
++        path = shutil.which(name)
++        if path:
++            return path
++    return None
++
++
++def available() -> bool:
++    return find_espeak() is not None
++
++
++def detect_language(text: str, default: str = "en") -> str:
++    """Грубое определение языка текста: кириллица → ru, иначе default."""
++    return "ru" if CYRILLIC_RE.search(text or "") else default
++
++
++def resolve_voice(text: str, language: str = "auto") -> str:
++    """'auto' → автоопределение по тексту, иначе код языка как есть."""
++    if not language or language == "auto":
++        return detect_language(text)
++    return language
++
++
++def wpm_from_speed(speed: float) -> int:
++    """Коэффициент скорости UI (0.5–2.0) → слов в минуту espeak (80–450, clamp)."""
++    try:
++        speed = float(speed)
++    except (TypeError, ValueError):
++        speed = 1.0
++    wpm = int(round(BASE_WPM * speed))
++    return max(80, min(450, wpm))
++
++
++def wav_info(path: str) -> tuple[int, int, float]:
++    """(frames, sample_rate, duration_sec) для WAV-файла."""
++    with wave.open(path, "rb") as wf:
++        frames = wf.getnframes()
++        rate = wf.getframerate()
++    duration = frames / float(rate) if rate else 0.0
++    return frames, rate, duration
++
++
++def synthesize(
++    text: str,
++    out_path: str | None = None,
++    *,
++    language: str = "auto",
++    speed: float = 1.0,
++    timeout: int = 120,
++    _binary: str | None = None,
++) -> SynthesisResult:
++    """Синтезирует речь в WAV-файл и возвращает факты о нём.
++
++    Кидает RuntimeError при отказе бэкенда — вызывающий код показывает
++    ошибку пользователю; файла-пустышки не создаётся.
++    """
++    binary = _binary or find_espeak()
++    if not binary:
++        raise RuntimeError("espeak binary not found")
++
++    text = (text or "").strip()
++    if not text:
++        raise ValueError("empty text")
++
++    if out_path is None:
++        fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="espeak_")
++        os.close(fd)
++
++    voice = resolve_voice(text, language)
++    cmd = [
++        binary,
++        "-v", voice,
++        "-s", str(wpm_from_speed(speed)),
++        "-w", out_path,
++        text,
++    ]
++    proc = subprocess.run(
++        cmd, capture_output=True, text=True, timeout=timeout, check=False,
++    )
++    # espeak пишет предупреждения в stderr даже при успехе — судим по файлу
++    if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) <= 44:
++        raise RuntimeError(
++            f"espeak failed (code {proc.returncode}): {proc.stderr.strip()[:300]}"
++        )
++
++    frames, rate, duration = wav_info(out_path)
++    if frames <= 0:
++        raise RuntimeError("espeak produced zero-length audio")
++    return SynthesisResult(path=out_path, duration_sec=duration, sample_rate=rate, frames=frames)
+diff --git a/ai_studio_core/ai_studio_core/i18n.py b/ai_studio_core/ai_studio_core/i18n.py
+index 3fbd337..340d0a7 100644
+--- a/ai_studio_core/ai_studio_core/i18n.py
++++ b/ai_studio_core/ai_studio_core/i18n.py
+@@ -220,6 +220,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "ctl_img_missing": "No image backend available: install diffusers/torch or configure an image API key",
+         "ctl_export_done": "Exported:",
+         "ctl_export_fail": "Export failed",
++        "msg_nothing_to_export": "Nothing to export yet — generate audio first.",
++        "dlg_save_audio": "Export audio",
+         # ── gpt_client provider labels ──
+         "prov_groq": "Groq (fast, VPN required)",
+         "prov_openrouter": "OpenRouter (works without VPN)",
+@@ -401,6 +403,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "ctl_img_missing": "Нет image-бэкенда: установите diffusers/torch или укажите ключ image API",
+         "ctl_export_done": "Экспортировано:",
+         "ctl_export_fail": "Ошибка экспорта",
++        "msg_nothing_to_export": "Экспортировать пока нечего — сначала сгенерируйте аудио.",
++        "dlg_save_audio": "Экспорт аудио",
+         # ── gpt_client provider labels ──
+         "prov_groq": "Groq (быстрый, нужен VPN)",
+         "prov_openrouter": "OpenRouter (работает без VPN)",
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index f722817..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/_constants.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/_constants.cpython-313.pyc
+deleted file mode 100644
+index afb8491..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/_constants.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/cache.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/cache.cpython-313.pyc
+deleted file mode 100644
+index 092e057..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/cache.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/downloader.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/downloader.cpython-313.pyc
+deleted file mode 100644
+index 489e6ea..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/downloader.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/metadata.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/metadata.cpython-313.pyc
+deleted file mode 100644
+index 5534e48..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/metadata.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/preview.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/preview.cpython-313.pyc
+deleted file mode 100644
+index ef60fd2..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/preview.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/sources.cpython-313.pyc b/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/sources.cpython-313.pyc
+deleted file mode 100644
+index 4137cb6..0000000
+Binary files a/ai_studio_core/ai_studio_core/rvc_catalog/__pycache__/sources.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index 20464aa..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/__pycache__/app.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/__pycache__/app.cpython-313.pyc
+deleted file mode 100644
+index 762a13e..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/__pycache__/app.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/__pycache__/main_window.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/__pycache__/main_window.cpython-313.pyc
+deleted file mode 100644
+index b723bf0..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/__pycache__/main_window.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index 06ba055..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/base_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/base_controller.cpython-313.pyc
+deleted file mode 100644
+index eebed7d..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/base_controller.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/chat_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/chat_controller.cpython-313.pyc
+deleted file mode 100644
+index 1d67131..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/chat_controller.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/model_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/model_controller.cpython-313.pyc
+deleted file mode 100644
+index 19666ec..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/model_controller.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/queue_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/queue_controller.cpython-313.pyc
+deleted file mode 100644
+index 7e29f9f..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/queue_controller.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/tts_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/tts_controller.cpython-313.pyc
+deleted file mode 100644
+index 774c2ec..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/tts_controller.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/queue_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/queue_controller.py
+index 22a3aa1..38be8a8 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/queue_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/queue_controller.py
+@@ -31,15 +31,6 @@ class QueueController(BaseController):
+     def __init__(self):
+         super().__init__()
+         self._tasks: dict[str, QueueTask] = {}
+-        # Две демо-задачи для отображения
+-        self._add_demo()
+-
+-    def _add_demo(self) -> None:
+-        from uuid import uuid4
+-        t1 = QueueTask(id=str(uuid4())[:6], type="TTS", model="XTTS v2", status="running", progress=45)
+-        t2 = QueueTask(id=str(uuid4())[:6], type="TTS", model="XTTS v2", status="queued", progress=0)
+-        for t in (t1, t2):
+-            self._tasks[t.id] = t
+ 
+     def add_task(self, type_: str, model: str, params: dict | None = None) -> str:
+         from uuid import uuid4
+@@ -49,6 +40,7 @@ class QueueController(BaseController):
+             model=model,
+             params=params or {},
+         )
++        task.status = "running"
+         self._tasks[task.id] = task
+         self.task_added.emit(task.id)
+         self.queue_changed.emit(list(self._tasks.values()))
+@@ -77,6 +69,8 @@ class QueueController(BaseController):
+             t.progress = percent
+             t.status = status
+             self.task_updated.emit(task_id)
++            # Панель перерисовывается по queue_changed — прогресс виден живьём
++            self.queue_changed.emit(list(self._tasks.values()))
+ 
+     def running_count(self) -> int:
+         return sum(1 for t in self._tasks.values() if t.status == "running")
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
+index 0d9a3bf..7152129 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
+@@ -1,7 +1,18 @@
+-"""Контроллер TTS Workspace."""
++"""Контроллер TTS Workspace — реальный синтез через доступные бэкенды.
++
++Бэкенды (по приоритету):
++  1. coqui   — torch + TTS (XTTS v2), если extras .[ml] установлены;
++  2. espeak  — системный espeak-ng/espeak (реальный WAV без ML-зависимостей).
++
++Если ни один недоступен — пользователь получает честную ошибку,
++файла-пустышки не создаётся. RVC пока не имеет бэкенда в этой сборке —
++при включённом RVC генерация останавливается с явной ошибкой заранее.
++"""
+ from __future__ import annotations
+ 
+-from pathlib import Path
++import os
++import wave
++from types import SimpleNamespace
+ 
+ from PySide6.QtCore import Signal, Slot
+ 
+@@ -9,103 +20,348 @@ from ai_studio_core.i18n import t as tr
+ 
+ from .base_controller import BaseController
+ 
++CHUNK_SILENCE_MS = 150  # пауза между склеенными чанками
++
++
++def _coqui_available() -> bool:
++    try:
++        import torch  # noqa: F401
++        import TTS    # noqa: F401
++        return True
++    except Exception:
++        return False
++
++
++def _detect_backend() -> str | None:
++    from ai_studio_core import espeak_tts
++    if _coqui_available():
++        return "coqui"
++    if espeak_tts.available():
++        return "espeak"
++    return None
++
++
++def _concat_wavs(paths: list[str], out_path: str, silence_ms: int = CHUNK_SILENCE_MS) -> None:
++    """Склеивает WAV-чанки (одинаковых параметров) в один файл с паузами."""
++    if not paths:
++        raise ValueError("nothing to concat")
++    frames_all: list[bytes] = []
++    params = None
++    silence_b = b""
++    for i, p in enumerate(paths):
++        with wave.open(p, "rb") as wf:
++            cp = wf.getparams()
++            if params is None:
++                params = cp
++                silence_frames = int(cp.framerate * silence_ms / 1000)
++                silence_b = b"\x00" * silence_frames * cp.sampwidth * cp.nchannels
++            elif (cp.nchannels, cp.sampwidth, cp.framerate) != (
++                params.nchannels, params.sampwidth, params.framerate
++            ):
++                raise ValueError(f"chunk {p} has different wav params")
++            frames_all.append(wf.readframes(wf.getnframes()))
++            if i < len(paths) - 1:
++                frames_all.append(silence_b)
++
++    with wave.open(out_path, "wb") as out:
++        out.setparams(params)
++        out.writeframes(b"".join(frames_all))
++
+ 
+ class TTSController(BaseController):
+     # Сигналы для UI
+     generation_started = Signal()
+     generation_progress = Signal(int, str)
+-    generation_complete = Signal(str)
++    generation_complete = Signal(str)      # путь к итоговому аудио
+     pipeline_step_changed = Signal(int, str)
+-    waveform_ready = Signal(list)
++    backend_changed = Signal(str)          # "coqui" | "espeak"
+ 
+     def __init__(self):
+         super().__init__()
+-        self._engine_loaded = False
+         self._normalize_fn = None
+         self._chunk_fn = None
++        self._backend: str | None = None
++        self._queue = None          # QueueController (attach_queue)
++        self._task_id: str | None = None
++        self._last_output: str | None = None
++
++    # ── Публичное API ──
++
++    def backend(self) -> str | None:
++        return self._backend
++
++    def last_output(self) -> str | None:
++        return self._last_output
++
++    def attach_queue(self, queue_controller) -> None:
++        """Подключает очередь задач: генерация регистрирует в ней реальную задачу."""
++        self._queue = queue_controller
++
++    def export_last(self, target_path: str) -> str:
++        """Конвертирует/копирует последний результат в target_path (формат — по расширению)."""
++        if not self._last_output or not os.path.exists(self._last_output):
++            raise RuntimeError("no generated audio to export")
++        src_ext = os.path.splitext(self._last_output)[1].lower()
++        dst_ext = os.path.splitext(target_path)[1].lower().lstrip(".")
++        if not dst_ext:
++            raise ValueError("target has no extension")
++        if f".{dst_ext}" == src_ext:
++            import shutil
++            shutil.copyfile(self._last_output, target_path)
++            return target_path
++        return self._convert(self._last_output, target_path, dst_ext)
++
++    # ── Внутренняя подготовка ──
+ 
+     def _ensure_engine(self) -> bool:
+-        if self._engine_loaded:
++        if self._normalize_fn is not None and self._chunk_fn is not None:
+             return True
+         try:
+             from ai_studio_core.normalizer import TextNormalizer
+             from ai_studio_core.chunker import TextChunker
+             self._normalize_fn = TextNormalizer().normalize
+             self._chunk_fn = TextChunker().chunk_text
+-            self._engine_loaded = True
+-            self.status_message.emit(tr("ctl_engine_loaded"))
+             self.log_message.emit("INFO", tr("ctl_engine_loaded"))
+             return True
+         except Exception as e:
+-            self.status_message.emit(tr("ctl_tts_missing"))
+-            self.log_message.emit("WARN", f"TTS engine unavailable: {e}")
++            self.log_message.emit("WARN", f"TTS engine deps unavailable: {e}")
+             return False
+ 
++    def _ensure_backend(self) -> bool:
++        if self._backend is None:
++            self._backend = _detect_backend()
++            if self._backend:
++                self.backend_changed.emit(self._backend)
++                self.log_message.emit("INFO", f"TTS backend: {self._backend}")
++        return self._backend is not None
++
++    # ── Генерация ──
++
+     @Slot(str, dict)
+     def on_generate(self, text: str, params: dict) -> None:
+-        if not self._ensure_engine():
++        engine_ok = self._ensure_engine()
++        backend_ok = self._ensure_backend()
++
++        if not engine_ok or not backend_ok:
+             self.pipeline_step_changed.emit(0, "error")
+             self.error_occurred.emit(tr("ctl_tts_missing"))
++            self.status_message.emit(tr("ctl_tts_missing"))
++            return
++
++        if params.get("rvc_enabled"):
++            # Честный гейт: RVC-бэкенда в сборке нет — не выдаём синтез за конвертацию.
++            self.pipeline_step_changed.emit(3, "error")
++            self.error_occurred.emit(tr("ctl_rvc_missing"))
++            self.log_message.emit("WARN", tr("ctl_rvc_missing"))
+             return
++
+         self.generation_started.emit()
++        if self._queue is not None:
++            self._task_id = self._queue.add_task(
++                "TTS", self._backend or "?", {"language": params.get("language", "auto")}
++            )
+         worker = self._run_in_background(self._generate_impl, text=text, params=params)
+         worker.progress.connect(self.generation_progress.emit)
++        worker.progress.connect(self._on_worker_progress)
+         worker.result.connect(self._on_done)
++        worker.error.connect(self._on_impl_error)
++
++    def _on_worker_progress(self, pct: int, _status: str) -> None:
++        if self._queue is not None and self._task_id:
++            self._queue.set_task_progress(self._task_id, int(pct), "running")
+ 
+-    def _generate_impl(
+-        self, text: str, params: dict,
+-        progress_callback=None, cancel_check=None,
+-    ) -> str:
+-        # Step 1: Normalize
++    def _generate_impl(self, text: str, params: dict,
++                       progress_callback=None, cancel_check=None) -> str:
++        # Выходной каталог должен существовать до записи волн
++        try:
++            from ai_studio_core.paths import OUTPUT_DIR
++            os.makedirs(OUTPUT_DIR, exist_ok=True)
++        except Exception:
++            pass
++
++        # 1. Normalize
+         if progress_callback:
+             progress_callback(10, "Normalizing…")
++        self.pipeline_step_changed.emit(0, "done")
+         self.pipeline_step_changed.emit(1, "active")
+         normalized = self._normalize_fn(text) if self._normalize_fn else text
+         if cancel_check and cancel_check():
+-            return ""
++            return self._aborted()
+         self.pipeline_step_changed.emit(1, "done")
+ 
+-        # Step 2: Chunk
++        # 2. Chunk
+         if progress_callback:
+-            progress_callback(25, "Chunking…")
++            progress_callback(20, "Chunking…")
+         self.pipeline_step_changed.emit(2, "active")
+         chunks = self._chunk_fn(normalized) if self._chunk_fn else [normalized]
++        chunks = [c for c in chunks if c and c.strip()] or [normalized]
+         if cancel_check and cancel_check():
+-            return ""
++            return self._aborted()
++
++        # 3. Synthesis per chunk (реальный бэкенд)
++        if self._backend == "coqui":
++            wav_path = self._synthesize_coqui(chunks, params, progress_callback, cancel_check)
++        else:
++            wav_path = self._synthesize_espeak(chunks, params, progress_callback, cancel_check)
++        if not wav_path:  # отменено
++            return self._aborted()
+         self.pipeline_step_changed.emit(2, "done")
+ 
+-        # Step 3: TTS
+-        if progress_callback:
+-            progress_callback(50, "Synthesizing…")
+-        self.pipeline_step_changed.emit(3, "active")
+-        import time
+-        time.sleep(0.4)
+-        out_path = str(Path.cwd() / "outputs" / "demo_output.wav")
++        # 4. RVC (в эту точку не дойдём при включённом RVC — гейт на входе)
+         self.pipeline_step_changed.emit(3, "done")
+ 
+-        # Step 4: RVC (optional)
+-        if params.get("rvc_enabled"):
+-            if progress_callback:
+-                progress_callback(80, "Applying RVC…")
+-            self.pipeline_step_changed.emit(4, "active")
+-            time.sleep(0.3)
+-            self.pipeline_step_changed.emit(4, "done")
+-
+-        # Step 5: De-ess/Output
++        # 5. Output: конвертация формата при необходимости
++        self.pipeline_step_changed.emit(5, "active")
+         if progress_callback:
+             progress_callback(95, "Finalizing…")
+-        self.pipeline_step_changed.emit(5, "active")
+-        time.sleep(0.1)
++        final_path = self._apply_output_format(wav_path, params)
+         if progress_callback:
+             progress_callback(100, "Done")
++        self.pipeline_step_changed.emit(4, "done")
+         self.pipeline_step_changed.emit(5, "done")
++        return final_path
++
++    def _synthesize_espeak(self, chunks, params, progress_callback, cancel_check) -> str:
++        from ai_studio_core import espeak_tts
++        from ai_studio_core.output_naming import _make_output_name
++
++        if params.get("reference_audio"):
++            self.log_message.emit(
++                "WARN", "espeak backend: reference audio is not supported "
++                "(voice cloning requires Coqui XTTS backend) — using default voice"
++            )
++        part_paths: list[str] = []
++        try:
++            for i, chunk in enumerate(chunks):
++                if cancel_check and cancel_check():
++                    return ""
++                res = espeak_tts.synthesize(
++                    chunk,
++                    language=params.get("language", "auto"),
++                    speed=params.get("speed", 1.0),
++                )
++                part_paths.append(res.path)
++                pct = 20 + int(70 * (i + 1) / len(chunks))
++                if progress_callback:
++                    progress_callback(pct, f"Synthesizing {i + 1}/{len(chunks)}…")
++            out_path = _make_output_name(chunks[0])
++            if len(part_paths) == 1:
++                import shutil
++                shutil.move(part_paths[0], out_path)
++            else:
++                _concat_wavs(part_paths, out_path)
++            return out_path
++        finally:
++            for p in part_paths:
++                try:
++                    if os.path.exists(p):
++                        os.remove(p)
++                except OSError:
++                    pass
++
++    def _synthesize_coqui(self, chunks, params, progress_callback, cancel_check) -> str:
++        """Coqui XTTS v2 — задействуется только когда extras .[ml] установлены."""
++        import torch
++        from TTS.api import TTS
++        from ai_studio_core.output_naming import _make_output_name
++
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++        tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
++        part_paths: list[str] = []
++        import tempfile
++        ref = params.get("reference_audio") or None
++        if not ref:
++            raise RuntimeError(
++                "Coqui XTTS requires a reference audio file for voice cloning. "
++                "Drop a .wav into the reference zone or use the espeak backend."
++            )
++        lang = params.get("language", "auto")
++        lang = "en" if lang == "auto" else lang
++        for i, chunk in enumerate(chunks):
++            if cancel_check and cancel_check():
++                return ""
++            fd, part = tempfile.mkstemp(suffix=".wav", prefix="xtts_")
++            os.close(fd)
++            tts.tts_to_file(text=chunk, speaker_wav=ref, language=lang, file_path=part)
++            part_paths.append(part)
++            if progress_callback:
++                progress_callback(20 + int(70 * (i + 1) / len(chunks)),
++                                  f"Synthesizing {i + 1}/{len(chunks)}…")
++        out_path = _make_output_name(chunks[0])
++        if len(part_paths) == 1:
++            import shutil
++            shutil.move(part_paths[0], out_path)
++        else:
++            _concat_wavs(part_paths, out_path)
+         return out_path
+ 
++    def _apply_output_format(self, wav_path: str, params: dict) -> str:
++        out_format = str(params.get("output_format", "wav")).lower()
++        if out_format in ("", "wav"):
++            return wav_path
++        target = os.path.splitext(wav_path)[0] + f".{out_format}"
++        converted = self._convert(wav_path, target, out_format)
++        try:
++            os.remove(wav_path)
++        except OSError:
++            pass
++        return converted
++
++    def _convert(self, src: str, dst: str, fmt: str) -> str:
++        """Реальная конвертация через pydub+ffmpeg; честная ошибка при недоступности."""
++        try:
++            from pydub import AudioSegment
++        except ImportError as e:
++            raise RuntimeError(
++                "Audio conversion requires pydub+ffmpeg. "
++                "Install ffmpeg or keep WAV as output format."
++            ) from e
++        audio = AudioSegment.from_wav(src)
++        audio.export(dst, format=fmt)
++        if not os.path.exists(dst) or os.path.getsize(dst) == 0:
++            raise RuntimeError(f"conversion to {fmt} produced empty file")
++        return dst
++
++    def _aborted(self) -> str:
++        if self._queue is not None and self._task_id:
++            self._queue.set_task_progress(self._task_id, 0, "cancelled")
++        self.status_message.emit(tr("ctl_gen_cancelled"))
++        return ""
++
+     def _on_done(self, output_path: str) -> None:
++        if not output_path:
++            return
++        self._last_output = output_path
++        if self._queue is not None and self._task_id:
++            self._queue.set_task_progress(self._task_id, 100, "done")
++        self._record_history(output_path)
+         self.generation_complete.emit(output_path)
+-        self.status_message.emit(f"Generation complete: {output_path}")
++        self.status_message.emit(f'{tr("msg_generation_complete")}: {output_path}')
+         self.log_message.emit("INFO", f"Generated: {output_path}")
+ 
++    def _on_impl_error(self, message: str) -> None:
++        if self._queue is not None and self._task_id:
++            self._queue.set_task_progress(self._task_id, 0, "error")
++
++    def _record_history(self, output_path: str) -> None:
++        try:
++            from ai_studio_core.history_store import save_history
++            from ai_studio_core.espeak_tts import wav_info
++            try:
++                _frames, _rate, duration = wav_info(output_path)
++            except Exception:
++                duration = 0.0
++            task = SimpleNamespace(
++                text=os.path.basename(output_path),
++                voice=self._backend or "",
++                quality="",
++                output_path=output_path,
++                stats={"time_sec": round(duration, 2), "chunks": 0},
++            )
++            save_history(task)
++        except Exception as e:
++            self.log_message.emit("WARN", f"history record failed: {e}")
++
+     @Slot()
+     def on_stop(self) -> None:
+         self.cancel_current()
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index 6ed0fea..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/about.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/about.cpython-313.pyc
+deleted file mode 100644
+index 17df103..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/about.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/env_setup_wizard.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/env_setup_wizard.cpython-313.pyc
+deleted file mode 100644
+index bc6b6c7..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/env_setup_wizard.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/error_report.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/error_report.cpython-313.pyc
+deleted file mode 100644
+index 8b73e80..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/error_report.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/model_download.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/model_download.cpython-313.pyc
+deleted file mode 100644
+index 6ba89a3..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/model_download.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/main_window.py b/ai_studio_core/ai_studio_core/ui/main_window.py
+index 774044d..6ba7282 100644
+--- a/ai_studio_core/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ai_studio_core/ui/main_window.py
+@@ -257,9 +257,11 @@ class MainWindow(QMainWindow):
+ 
+     # ── Wiring controllers <→ UI ──
+     def _wire_controllers(self) -> None:
+-        # TTS
++        # TTS (очередь задач получает реальные задачи генерации)
++        self._tts_ctrl.attach_queue(self._queue_ctrl)
+         self._tts_workspace.generate_requested.connect(self._tts_ctrl.on_generate)
+         self._tts_workspace.stop_requested.connect(self._tts_ctrl.on_stop)
++        self._tts_workspace.export_requested.connect(self._on_export)
+         self._tts_ctrl.busy_changed.connect(self._tts_workspace.set_busy)
+         self._tts_ctrl.status_message.connect(self._resource_bar.set_message)
+         self._tts_ctrl.pipeline_step_changed.connect(self._on_tts_step)
+@@ -277,6 +279,9 @@ class MainWindow(QMainWindow):
+         self._chat_ctrl.log_message.connect(self._log_widget.append)
+         self._chat_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
+ 
++        # History: выбор элемента → Inspector
++        self._history_widget.item_selected.connect(self._on_history_selected)
++
+         # Model hub
+         self._model_widget.download_requested.connect(self._model_ctrl.download_model)
+         self._model_widget.delete_requested.connect(self._model_ctrl.delete_model)
+@@ -297,6 +302,33 @@ class MainWindow(QMainWindow):
+     def _on_tts_done(self, output_path: str) -> None:
+         self._resource_bar.set_message(f'{tr("msg_generation_complete")}: {output_path}')
+         self._toast(f'{tr("msg_generation_complete")}\n{output_path}', "success")
++        # Реальная волна + воспроизведение + экспорт
++        try:
++            wf = self._tts_workspace.waveform_widget()
++            wf.set_audio(output_path)
++            self._tts_workspace.set_export_available(True)
++            if self._tts_workspace.autoplay_checked():
++                wf._toggle_play()
++        except Exception as e:
++            self._log_widget.append("WARN", f"waveform load failed: {e}")
++        # История обновляется с диска — записи реальные
++        self._history_widget.refresh()
++
++    def _on_history_selected(self, path: str) -> None:
++        import os
++        props = {}
++        try:
++            st = os.stat(path)
++            props = {
++                "Size": f"{st.st_size / (1024 * 1024):.2f} MB",
++                "Path": path,
++            }
++        except OSError:
++            props = {"Path": path}
++        self._inspector_widget.show_item(
++            os.path.basename(path), "TTS", props,
++            details=path,
++        )
+ 
+     # ── Layout persistence ──
+     def _restore_layout(self) -> None:
+@@ -323,7 +355,32 @@ class MainWindow(QMainWindow):
+         self._toast(tr("msg_menu_stub"), "info")
+ 
+     def _on_export(self) -> None:
+-        self._toast(tr("msg_menu_stub"), "info")
++        """Реальный экспорт последнего сгенерированного аудио."""
++        last = self._tts_ctrl.last_output()
++        if not last:
++            self._toast(tr("msg_nothing_to_export"), "warning")
++            return
++        import os
++        from PySide6.QtWidgets import QFileDialog
++        ext = os.path.splitext(last)[1].lower().lstrip(".") or "wav"
++        suggested = os.path.basename(last)
++        target, _sel = QFileDialog.getSaveFileName(
++            self, tr("dlg_save_audio"), suggested,
++            "Audio (*.wav *.mp3 *.flac *.ogg)",
++        )
++        if not target:
++            return
++        # Пользователь мог не дописать расширение — берём формат источника
++        if not os.path.splitext(target)[1]:
++            target = f"{target}.{ext}"
++        try:
++            out = self._tts_ctrl.export_last(target)
++        except Exception as e:
++            self._toast(f'{tr("ctl_export_fail")}\n{type(e).__name__}: {e}', "error")
++            self._log_widget.append("ERROR", f"export failed: {e}")
++            return
++        self._toast(f'{tr("ctl_export_done")}\n{out}', "success")
++        self._resource_bar.set_message(f'{tr("ctl_export_done")} {out}')
+ 
+     def _on_manage_models(self) -> None:
+         self._toast(tr("msg_menu_stub"), "info")
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index 82bdb8c..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/history_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/history_panel.cpython-313.pyc
+deleted file mode 100644
+index 7c5541f..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/history_panel.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/inspector_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/inspector_panel.cpython-313.pyc
+deleted file mode 100644
+index f59cab6..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/inspector_panel.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/model_hub_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/model_hub_panel.cpython-313.pyc
+deleted file mode 100644
+index edb8079..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/model_hub_panel.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/queue_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/queue_panel.cpython-313.pyc
+deleted file mode 100644
+index eea64c7..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/queue_panel.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/settings_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/settings_panel.cpython-313.pyc
+deleted file mode 100644
+index 9e7abc7..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/settings_panel.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/history_panel.py b/ai_studio_core/ai_studio_core/ui/panels/history_panel.py
+index 2661966..5b48bef 100644
+--- a/ai_studio_core/ai_studio_core/ui/panels/history_panel.py
++++ b/ai_studio_core/ai_studio_core/ui/panels/history_panel.py
+@@ -1,6 +1,14 @@
+-"""History — левый dock (tabified с Model Hub)."""
++"""History — левый dock (tabified с Model Hub).
++
++Показывает реальные файлы из каталога вывода (outputs/), отсортированные
++по времени изменения. Никаких демо-записей.
++"""
+ from __future__ import annotations
+ 
++import os
++from datetime import datetime
++from pathlib import Path
++
+ from PySide6.QtCore import Signal
+ from PySide6.QtWidgets import (
+     QComboBox, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem,
+@@ -11,13 +19,49 @@ from ai_studio_core.i18n import t as tr
+ 
+ from ..theme.tokens import TOKENS
+ 
++AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
++
++_TYPE_ICONS = {"TTS": "🎙", "Chat": "💬", "Image": "🖼"}
++
++
++def scan_outputs(output_dir: str) -> list[dict]:
++    """Реальные аудиофайлы каталога: новые сверху."""
++    entries: list[dict] = []
++    try:
++        for name in os.listdir(output_dir):
++            ext = os.path.splitext(name)[1].lower()
++            if ext not in AUDIO_EXTS:
++                continue
++            full = os.path.join(output_dir, name)
++            try:
++                st = os.stat(full)
++            except OSError:
++                continue
++            entries.append({
++                "path": full,
++                "name": name,
++                "mtime": st.st_mtime,
++                "size": st.st_size,
++                "type": "TTS",
++            })
++    except OSError:
++        return []
++    entries.sort(key=lambda e: e["mtime"], reverse=True)
++    return entries
++
++
++def _fmt_time(mtime: float) -> str:
++    return datetime.fromtimestamp(mtime).strftime("%d.%m %H:%M")
++
+ 
+ class HistoryPanel(QWidget):
+-    item_selected = Signal(str)
++    item_selected = Signal(str)     # path
+     item_deleted = Signal(str)
+ 
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
++        self._entries: list[dict] = []
++
+         layout = QVBoxLayout(self)
+         layout.setSpacing(TOKENS.spacing.sm)
+         layout.setContentsMargins(
+@@ -27,11 +71,13 @@ class HistoryPanel(QWidget):
+ 
+         filter_row = QHBoxLayout()
+         self._type_filter = QComboBox()
+-        self._type_filter.addItems([tr("hist_all"), "TTS", "Chat", "Image"])
++        self._type_filter.addItems([tr("hist_all"), "TTS"])
+         self._type_filter.setFixedWidth(90)
++        self._type_filter.currentIndexChanged.connect(lambda _i: self._apply_filter())
+         filter_row.addWidget(self._type_filter)
+         self._search = QLineEdit()
+         self._search.setPlaceholderText(tr("hist_search_ph"))
++        self._search.textChanged.connect(lambda _t: self._apply_filter())
+         filter_row.addWidget(self._search)
+         layout.addLayout(filter_row)
+ 
+@@ -43,15 +89,66 @@ class HistoryPanel(QWidget):
+             f"QListWidget::item {{ padding: {TOKENS.spacing.sm}px; "
+             f"border-bottom: 1px solid {TOKENS.colors.border_default}; }}"
+         )
+-        for text, time, type_ in [
+-            ("Hello world test…", "2 min ago", "🎙 TTS"),
+-            ("Write a poem about…", "15 min ago", "💬 Chat"),
+-            ("Long narration ch.1…", "1 hour ago", "🎙 TTS"),
+-            ("RVC conversion 01…", "3 hours ago", "🎙 RVC"),
+-        ]:
+-            self._list.addItem(QListWidgetItem(f"{type_}  {text}\n     {time}"))
++        self._list.itemDoubleClicked.connect(self._on_double_click)
++        self._list.currentItemChanged.connect(self._on_current_changed)
+         layout.addWidget(self._list, stretch=1)
+ 
++        self.refresh()
++
++    # ── Public ──
++
++    def refresh(self) -> None:
++        """Перечитывает outputs-каталог (после генерации, при старте и т.д.)."""
++        try:
++            from ai_studio_core.paths import OUTPUT_DIR
++            output_dir = OUTPUT_DIR
++        except Exception:
++            output_dir = "outputs"
++        self._entries = scan_outputs(output_dir)
++        self._apply_filter()
++
++    def entries(self) -> list[dict]:
++        return list(self._entries)
++
++    # ── Internals ──
++
++    def _apply_filter(self) -> None:
++        self._list.clear()
++        query = self._search.text().strip().lower()
++        type_filter = self._type_filter.currentText()
++        shown = 0
++        for e in self._entries:
++            if type_filter != tr("hist_all") and e["type"] != type_filter:
++                continue
++            if query and query not in e["name"].lower():
++                continue
++            icon = _TYPE_ICONS.get(e["type"], "📄")
++            size_mb = e["size"] / (1024 * 1024)
++            item = QListWidgetItem(
++                f'{icon} {e["name"]}\n     {_fmt_time(e["mtime"])} · {size_mb:.2f} MB'
++            )
++            item.setData(32, e["path"])  # Qt.UserRole
++            self._list.addItem(item)
++            shown += 1
++        if shown == 0:
++            self._list.addItem(QListWidgetItem(tr("hist_empty")))
++
++    def _on_double_click(self, item: QListWidgetItem) -> None:
++        path = item.data(32)
++        if path:
++            self.item_selected.emit(path)
++
++    def _on_current_changed(self, item: QListWidgetItem, _prev) -> None:
++        # Одиночный выбор тоже полезен (Inspector покажет файл)
++        if item is None:
++            return
++        path = item.data(32)
++        if path:
++            self.item_selected.emit(path)
++
+     def retranslate_ui(self) -> None:
++        self._type_filter.blockSignals(True)
+         self._type_filter.setItemText(0, tr("hist_all"))
++        self._type_filter.blockSignals(False)
+         self._search.setPlaceholderText(tr("hist_search_ph"))
++        self._apply_filter()
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index a05e9a5..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/palette.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/palette.cpython-313.pyc
+deleted file mode 100644
+index 1bc8d17..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/palette.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/tokens.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/tokens.cpython-313.pyc
+deleted file mode 100644
+index de93c90..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/tokens.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index 6bf7380..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/collapsible_group.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/collapsible_group.cpython-313.pyc
+deleted file mode 100644
+index 9cfbc10..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/collapsible_group.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/file_drop_zone.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/file_drop_zone.cpython-313.pyc
+deleted file mode 100644
+index 19222ba..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/file_drop_zone.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/log_console.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/log_console.cpython-313.pyc
+deleted file mode 100644
+index be4aad7..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/log_console.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/model_selector.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/model_selector.cpython-313.pyc
+deleted file mode 100644
+index dc337d9..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/model_selector.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/pipeline_strip.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/pipeline_strip.cpython-313.pyc
+deleted file mode 100644
+index 3fe56cd..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/pipeline_strip.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/progress_overlay.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/progress_overlay.cpython-313.pyc
+deleted file mode 100644
+index 43d157f..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/progress_overlay.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/status_bar.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/status_bar.cpython-313.pyc
+deleted file mode 100644
+index 2f6fd44..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/status_bar.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/tag_input.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/tag_input.cpython-313.pyc
+deleted file mode 100644
+index 81a26f3..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/tag_input.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/toast.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/toast.cpython-313.pyc
+deleted file mode 100644
+index 9897c33..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/toast.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/waveform_view.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/waveform_view.cpython-313.pyc
+deleted file mode 100644
+index c44a8cc..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/waveform_view.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/waveform_view.py b/ai_studio_core/ai_studio_core/ui/widgets/waveform_view.py
+index 7100b1c..1e5f67c 100644
+--- a/ai_studio_core/ai_studio_core/ui/widgets/waveform_view.py
++++ b/ai_studio_core/ai_studio_core/ui/widgets/waveform_view.py
+@@ -1,18 +1,144 @@
+-"""Визуализация аудио-волны (placeholder до полноценного QPainter-рендера)."""
++"""Визуализация аудио-волны.
++
++set_audio(path) загружает WAV, вычисляет реальные пики амплитуды и рисует их
++QPainter'ом. Проигрывание — через QSoundEffect, если мультимедиа-бэкенд
++доступен (offscreen/headless — кнопка честно отключена).
++"""
+ from __future__ import annotations
+ 
++import os
++import wave
++from pathlib import Path
++
++import numpy as np
+ from PySide6.QtCore import Qt
++from PySide6.QtGui import QColor, QPainter, QPen
+ from PySide6.QtWidgets import (
+-    QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
++    QHBoxLayout, QLabel, QSlider, QToolButton, QVBoxLayout, QWidget,
+ )
+ 
+ from ..theme.tokens import TOKENS
+ 
+ 
++def compute_peaks(path: str, buckets: int = 160) -> list[float]:
++    """Читает WAV и возвращает список пиков амплитуды [0..1] длиной buckets.
++
++    Работает с 8/16/24/32-bit PCM и float WAV; моно/стерео сводится.
++    При невозможности разобрать файл бросает ValueError.
++    """
++    with wave.open(path, "rb") as wf:
++        n_channels = wf.getnchannels()
++        sampwidth = wf.getsampwidth()
++        n_frames = wf.getnframes()
++        framerate = wf.getframerate()
++        comptype = wf.getcomptype()
++        if comptype != "NONE":
++            raise ValueError(f"compressed WAV not supported: {comptype}")
++        raw = wf.readframes(n_frames)
++
++    if n_frames <= 0:
++        raise ValueError("zero-length wav")
++
++    if sampwidth == 1:
++        data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
++        data = (data - 128.0) / 128.0
++    elif sampwidth == 2:
++        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
++    elif sampwidth == 3:
++        a = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
++        data = (a[:, 0] | (a[:, 1] << 8) | (a[:, 2] << 16))
++        data = np.where(data >= 1 << 23, data - (1 << 24), data).astype(np.float32)
++        data = data / float(1 << 23)
++    elif sampwidth == 4:
++        data = np.frombuffer(raw, dtype=np.int32).astype(np.float64) / float(1 << 31)
++        data = data.astype(np.float32)
++    else:
++        raise ValueError(f"unsupported sample width: {sampwidth}")
++
++    if n_channels > 1:
++        data = data.reshape(-1, n_channels).mean(axis=1)
++
++    data = np.abs(data)
++    if data.size == 0:
++        raise ValueError("no samples")
++
++    # Разбиваем на корзины и берём максимум в каждой
++    idx = np.linspace(0, data.size, num=buckets + 1).astype(int)
++    peaks = [float(data[idx[i]:idx[i + 1]].max()) if idx[i] < idx[i + 1] else 0.0
++             for i in range(buckets)]
++    top = max(peaks) or 1.0
++    return [p / top for p in peaks]
++
++
++def wav_duration(path: str) -> float:
++    with wave.open(path, "rb") as wf:
++        return wf.getnframes() / float(wf.getframerate() or 1)
++
++
++def _fmt_time(sec: float) -> str:
++    sec = max(0, int(round(sec)))
++    return f"{sec // 60:02d}:{sec % 60:02d}"
++
++
++class WaveformCanvas(QWidget):
++    """QPainter-канвас с барами громкости."""
++
++    def __init__(self, parent: QWidget | None = None):
++        super().__init__(parent)
++        self._peaks: list[float] = []
++        self.setMinimumHeight(60)
++
++    def set_peaks(self, peaks: list[float]) -> None:
++        self._peaks = list(peaks)
++        self.update()
++
++    def peaks(self) -> list[float]:
++        return list(self._peaks)
++
++    def paintEvent(self, event) -> None:
++        painter = QPainter(self)
++        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
++        painter.fillRect(self.rect(), QColor(TOKENS.colors.bg_primary))
++
++        if not self._peaks:
++            painter.setPen(QColor(TOKENS.colors.text_disabled))
++            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "—")
++            painter.end()
++            return
++
++        n = len(self._peaks)
++        w = max(1, self.width())
++        h = self.height()
++        mid = h // 2
++        bar_w = w / n
++
++        cold = QColor(TOKENS.colors.waveform_cold)
++        hot = QColor(TOKENS.colors.waveform_hot)
++        pen = QPen()
++        for i, p in enumerate(self._peaks):
++            t = p
++            color = QColor(
++                int(cold.red() + (hot.red() - cold.red()) * t),
++                int(cold.green() + (hot.green() - cold.green()) * t),
++                int(cold.blue() + (hot.blue() - cold.blue()) * t),
++            )
++            pen.setColor(color)
++            pen.setWidthF(max(1.0, bar_w * 0.7))
++            painter.setPen(pen)
++            x = int(i * bar_w + bar_w / 2)
++            amp = max(2.0, p * (h - 6))
++            painter.drawLine(x, int(mid - amp / 2), x, int(mid + amp / 2))
++        painter.end()
++
++
+ class WaveformView(QWidget):
++    """Единый виджет: канвас волны + транспорт (play/seek/время)."""
++
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
+-        self.setMinimumHeight(80)
++        self._path: str | None = None
++        self._player = None  # QSoundEffect, если доступен мультимедиа-бэкенд
++
+         self.setStyleSheet(
+             f"background: {TOKENS.colors.bg_secondary}; "
+             f"border: 1px solid {TOKENS.colors.border_default}; "
+@@ -25,18 +151,14 @@ class WaveformView(QWidget):
+             TOKENS.spacing.md, TOKENS.spacing.sm,
+         )
+ 
+-        wave_label = QLabel("▁▂▃▅▇▅▃▂▁▂▃▅▇▅▃▂▁▂▃▅▇▅▃▂▁▂▃▅▇▅▃▂▁▂▃▅▇▅▃▂▁")
+-        wave_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+-        wave_label.setStyleSheet(
+-            f"color: {TOKENS.colors.waveform_cold}; "
+-            f"font-size: 24px; letter-spacing: 2px; border: none;"
+-        )
+-        layout.addWidget(wave_label)
++        self._canvas = WaveformCanvas()
++        layout.addWidget(self._canvas, stretch=1)
+ 
+         transport = QHBoxLayout()
+-        self._btn_play = QLabel("▶")
+-        self._btn_play.setFixedWidth(30)
+-        self._btn_play.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none; font-size: 16px;")
++        self._btn_play = QToolButton()
++        self._btn_play.setText("▶")
++        self._btn_play.setFixedWidth(36)
++        self._btn_play.clicked.connect(self._toggle_play)
+         transport.addWidget(self._btn_play)
+ 
+         self._time_current = QLabel("00:00")
+@@ -46,9 +168,9 @@ class WaveformView(QWidget):
+         )
+         transport.addWidget(self._time_current)
+ 
+-        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
+-        self._seek_slider.setRange(0, 1000)
+-        transport.addWidget(self._seek_slider, stretch=1)
++        self._seek = QSlider(Qt.Orientation.Horizontal)
++        self._seek.setRange(0, 1000)
++        transport.addWidget(self._seek, stretch=1)
+ 
+         self._time_total = QLabel("00:00")
+         self._time_total.setStyleSheet(
+@@ -57,19 +179,49 @@ class WaveformView(QWidget):
+         )
+         transport.addWidget(self._time_total)
+ 
+-        self._volume = QLabel("🔊")
+-        self._volume.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
+-        transport.addWidget(self._volume)
+-
+         layout.addLayout(transport)
+ 
+-    def set_duration(self, seconds: float) -> None:
+-        self._time_total.setText(self._fmt(seconds))
++    # ── Public ──
++
++    def set_audio(self, path: str) -> list[float]:
++        """Загружает WAV: рисует пики, обновляет длительность. Возвращает пики."""
++        peaks = compute_peaks(path)
++        self._path = path
++        self._canvas.set_peaks(peaks)
++        duration = wav_duration(path)
++        self._time_total.setText(_fmt_time(duration))
++        self._time_current.setText("00:00")
++        self._seek.setValue(0)
++        self._prepare_player(path)
++        return peaks
++
++    def current_path(self) -> str | None:
++        return self._path
++
++    def has_audio(self) -> bool:
++        return self._path is not None
++
++    # ── Playback (best-effort, честно отключается без мультимедиа-бэкенда) ──
+ 
+-    def set_position(self, seconds: float) -> None:
+-        self._time_current.setText(self._fmt(seconds))
++    def _prepare_player(self, path: str) -> None:
++        self._player = None
++        try:
++            from PySide6.QtMultimedia import QSoundEffect
++            from PySide6.QtCore import QUrl
++            eff = QSoundEffect(self)
++            eff.setSource(QUrl.fromLocalFile(os.path.abspath(path)))
++            eff.setVolume(0.9)
++            self._player = eff
++            self._btn_play.setEnabled(True)
++        except Exception:
++            self._btn_play.setEnabled(False)  # нет бэкенда — честно, без подделки
+ 
+-    @staticmethod
+-    def _fmt(seconds: float) -> str:
+-        s = int(seconds)
+-        return f"{s // 60:02d}:{s % 60:02d}"
++    def _toggle_play(self) -> None:
++        if self._player is None:
++            return
++        if self._player.isPlaying():
++            self._player.stop()
++            self._btn_play.setText("▶")
++        else:
++            self._player.play()
++            self._btn_play.setText("⏹")
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/__init__.cpython-313.pyc
+deleted file mode 100644
+index 971ef42..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/__init__.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/base_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/base_workspace.cpython-313.pyc
+deleted file mode 100644
+index 217944e..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/base_workspace.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/chat_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/chat_workspace.cpython-313.pyc
+deleted file mode 100644
+index 4fc27c3..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/chat_workspace.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/image_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/image_workspace.cpython-313.pyc
+deleted file mode 100644
+index 63c5406..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/image_workspace.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/pipeline_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/pipeline_workspace.cpython-313.pyc
+deleted file mode 100644
+index 31a1113..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/pipeline_workspace.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/tts_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/tts_workspace.cpython-313.pyc
+deleted file mode 100644
+index 1ffb799..0000000
+Binary files a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/tts_workspace.cpython-313.pyc and /dev/null differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+index c5adbd6..4e59dee 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+@@ -260,7 +260,12 @@ class TTSWorkspace(BaseWorkspace):
+     def set_busy(self, busy: bool) -> None:
+         self._btn_generate.setEnabled(not busy)
+         self._btn_stop.setEnabled(busy)
+-        self._btn_export.setEnabled(not busy)
++
++    def set_export_available(self, available: bool) -> None:
++        self._btn_export.setEnabled(available)
++
++    def autoplay_checked(self) -> bool:
++        return self._out_autoplay.isChecked()
+ 
+     # ── Helpers ──
+ 
+diff --git a/ai_studio_core/test/__pycache__/test_ai_conductor.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_ai_conductor.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index b982093..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_ai_conductor.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_chunker.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_chunker.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index d20728b..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_chunker.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_cpu_gpu.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_cpu_gpu.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index ede00a2..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_cpu_gpu.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_de_esser.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_de_esser.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index cfd72ff..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_de_esser.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_diagnostics.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_diagnostics.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 04ba529..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_diagnostics.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_env_core_init.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_env_core_init.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 1c53f8f..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_env_core_init.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_env_setup.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_env_setup.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index c4f1544..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_env_setup.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_gpt_client.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_gpt_client.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 29ace06..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_gpt_client.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_history_store.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_history_store.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index de68b40..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_history_store.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_i18n_core.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_i18n_core.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 332edcf..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_i18n_core.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_llama_setup.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_llama_setup.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index ae8ec2f..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_llama_setup.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_local_llm_client.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_local_llm_client.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index c335c04..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_local_llm_client.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_local_llm_security.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_local_llm_security.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index cc7dcc5..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_local_llm_security.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_normalizer.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_normalizer.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index d5d7680..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_normalizer.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_output_naming.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_output_naming.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 57d2ddd..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_output_naming.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_prosody_layer.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_prosody_layer.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index b958919..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_prosody_layer.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_reference_processor.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_reference_processor.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 8722f74..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_reference_processor.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_release_hashing.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_release_hashing.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 86fbb6f..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_release_hashing.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_rvc_catalog.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_rvc_catalog.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 27dc458..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_rvc_catalog.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_rvc_pipeline.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_rvc_pipeline.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 62d23eb..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_rvc_pipeline.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_rvc_setup.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_rvc_setup.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index c51333f..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_rvc_setup.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_smart_pauses.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_smart_pauses.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index ef7ce83..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_smart_pauses.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_torch_setup.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_torch_setup.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 5831657..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_torch_setup.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_ui_language_switch.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_ui_language_switch.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 3834250..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_ui_language_switch.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_update_signing.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_update_signing.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 625a8af..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_update_signing.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_updater.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_updater.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 872b0bd..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_updater.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_validation.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_validation.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 228a727..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_validation.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_voice_manager.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_voice_manager.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index a1c67a3..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_voice_manager.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/__pycache__/test_word_replacer.cpython-313-pytest-9.0.3.pyc b/ai_studio_core/test/__pycache__/test_word_replacer.cpython-313-pytest-9.0.3.pyc
+deleted file mode 100644
+index 7161f1c..0000000
+Binary files a/ai_studio_core/test/__pycache__/test_word_replacer.cpython-313-pytest-9.0.3.pyc and /dev/null differ
+diff --git a/ai_studio_core/test/test_espeak_backend.py b/ai_studio_core/test/test_espeak_backend.py
+new file mode 100644
+index 0000000..e0bc23b
+--- /dev/null
++++ b/ai_studio_core/test/test_espeak_backend.py
+@@ -0,0 +1,113 @@
++# -*- coding: utf-8 -*-
++"""Тесты реального espeak-бэкенда TTS (ai_studio_core.espeak_tts).
++
++Бэкенд синтезирует настоящий WAV через системный espeak-ng/espeak —
++в среде CI бинарник установлен, поэтому тесты проверяют реальный звук,
++а не заглушки. Если бинарника нет — поведение честного отказа проверяется
++через monkeypatch.
++"""
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from ai_studio_core import espeak_tts
++from ai_studio_core.espeak_tts import (
++    BASE_WPM, available, detect_language, find_espeak,
++    resolve_voice, synthesize, wav_info, wpm_from_speed,
++)
++
++pytestmark = pytest.mark.skipif(
++    not available(), reason="espeak-ng/espeak не установлен в системе"
++)
++
++
++class TestDiscovery:
++    def test_binary_found(self):
++        path = find_espeak()
++        assert path and os.path.exists(path)
++
++    def test_available_true(self):
++        assert available() is True
++
++
++class TestVoiceResolution:
++    def test_detect_language_cyrillic(self):
++        assert detect_language("Привет, мир") == "ru"
++
++    def test_detect_language_latin(self):
++        assert detect_language("Hello world") == "en"
++        assert detect_language("") == "en"
++
++    def test_resolve_voice_auto(self):
++        assert resolve_voice("Привет", "auto") == "ru"
++        assert resolve_voice("Hello", "auto") == "en"
++
++    def test_resolve_voice_explicit(self):
++        assert resolve_voice("Hello", "de") == "de"
++        assert resolve_voice("Hello", "") == "en"   # пустой → auto→en
++
++
++class TestSpeedMapping:
++    def test_base_speed(self):
++        assert wpm_from_speed(1.0) == BASE_WPM
++
++    def test_speed_bounds(self):
++        assert wpm_from_speed(0.1) == 80      # нижний clamp
++        assert wpm_from_speed(10.0) == 450    # верхний clamp
++        assert wpm_from_speed(0.5) < BASE_WPM < wpm_from_speed(2.0)
++
++    def test_speed_garbage(self):
++        assert wpm_from_speed("junk") == BASE_WPM
++        assert wpm_from_speed(None) == BASE_WPM
++
++
++class TestSynthesisReal:
++    def test_synthesize_english(self, tmp_path):
++        out = str(tmp_path / "hello.wav")
++        res = synthesize("Hello world, this is a test.", out_path=out, language="en")
++        assert os.path.exists(out)
++        assert res.frames > 1000, "слишком мало сэмплов — похоже на пустышку"
++        assert res.sample_rate == 22050
++        assert res.duration_sec > 0.2
++        frames, rate, dur = wav_info(out)
++        assert (frames, rate) == (res.frames, res.sample_rate)
++        assert abs(dur - res.duration_sec) < 0.01
++
++    def test_synthesize_russian(self, tmp_path):
++        out = str(tmp_path / "privet.wav")
++        res = synthesize("Привет, мир!", out_path=out, language="auto")
++        assert os.path.exists(out) and res.frames > 1000
++
++    def test_synthesize_into_tempfile(self):
++        res = synthesize("Temporary output test.", language="en")
++        try:
++            assert os.path.exists(res.path)
++            assert res.path.endswith(".wav")
++        finally:
++            os.remove(res.path)
++
++    def test_empty_text_rejected(self):
++        with pytest.raises(ValueError):
++            synthesize("   ")
++        with pytest.raises(ValueError):
++            synthesize("")
++
++
++class TestHonestFailure:
++    def test_missing_binary_raises(self, monkeypatch, tmp_path):
++        """Нет бинарника → RuntimeError, а не тихая пустышка."""
++        monkeypatch.setattr(espeak_tts.shutil, "which", lambda _n: None)
++        monkeypatch.setattr(espeak_tts, "find_espeak", lambda: None)
++        with pytest.raises(RuntimeError, match="not found"):
++            synthesize("Hello", out_path=str(tmp_path / "x.wav"))
++        assert not (tmp_path / "x.wav").exists()
++
++    def test_backend_produces_real_file_not_placeholder(self, tmp_path):
++        """Анти-заглушка: размер файла адекватен длительности речи."""
++        out = str(tmp_path / "real.wav")
++        synthesize("This sentence should take a couple of seconds to pronounce.",
++                   out_path=out, language="en")
++        # 22050 Hz * 16 bit * mono ≈ 44100 B/s; файл должен быть заметно больше
++        assert os.path.getsize(out) > 44_100 * 0.5
+diff --git a/ai_studio_core/test/test_history_real.py b/ai_studio_core/test/test_history_real.py
+new file mode 100644
+index 0000000..9945582
+--- /dev/null
++++ b/ai_studio_core/test/test_history_real.py
+@@ -0,0 +1,106 @@
++# -*- coding: utf-8 -*-
++"""Тесты реальной панели истории: файлы из outputs/, без демо-записей."""
++from __future__ import annotations
++
++import os
++import struct
++import time
++import wave
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="панель — Qt-виджет")
++
++from PySide6.QtWidgets import QApplication
++
++from ai_studio_core import paths
++from ai_studio_core.ui.panels.history_panel import HistoryPanel, scan_outputs
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _touch_wav(path: str) -> None:
++    with wave.open(path, "wb") as wf:
++        wf.setnchannels(1)
++        wf.setsampwidth(2)
++        wf.setframerate(22050)
++        wf.writeframes(struct.pack("<hhh", 1000, -1000, 1000))
++
++
++@pytest.fixture()
++def outputs_dir(tmp_path, monkeypatch):
++    out = tmp_path / "outputs"
++    out.mkdir()
++    monkeypatch.setattr(paths, "OUTPUT_DIR", str(out))
++    return out
++
++
++class TestScanOutputs:
++    def test_picks_only_audio_sorted_desc(self, outputs_dir):
++        _touch_wav(str(outputs_dir / "a_first.wav"))
++        time.sleep(0.02)
++        _touch_wav(str(outputs_dir / "b_second.mp3"))
++        (outputs_dir / "notes.txt").write_text("junk", encoding="utf-8")
++        (outputs_dir / "another.log").write_text("junk", encoding="utf-8")
++        entries = scan_outputs(str(outputs_dir))
++        assert [e["name"] for e in entries] == ["b_second.mp3", "a_first.wav"]
++        assert all(e["type"] == "TTS" for e in entries)
++
++    def test_missing_dir_returns_empty(self, tmp_path):
++        assert scan_outputs(str(tmp_path / "nope")) == []
++
++    def test_empty_dir_returns_empty(self, outputs_dir):
++        assert scan_outputs(str(outputs_dir)) == []
++
++
++class TestHistoryPanel:
++    def test_panel_lists_real_files(self, app, outputs_dir):
++        _touch_wav(str(outputs_dir / "gen1.wav"))
++        _touch_wav(str(outputs_dir / "gen2.flac"))
++        panel = HistoryPanel()
++        names = [panel._list.item(i).text() for i in range(panel._list.count())]
++        assert any("gen1.wav" in n for n in names)
++        assert any("gen2.flac" in n for n in names)
++        panel.deleteLater()
++
++    def test_empty_state_honest_text(self, app, outputs_dir):
++        panel = HistoryPanel()
++        assert panel._list.count() == 1
++        assert "(" in panel._list.item(0).text()  # текст «(no generations yet)»
++        panel.deleteLater()
++
++    def test_selection_emits_real_path(self, app, outputs_dir):
++        f = str(outputs_dir / "take_me.wav")
++        _touch_wav(f)
++        panel = HistoryPanel()
++        received = []
++        panel.item_selected.connect(received.append)
++        item = panel._list.item(0)
++        panel._list.setCurrentItem(item)
++        assert received == [f]
++        panel.deleteLater()
++
++    def test_search_filter(self, app, outputs_dir):
++        _touch_wav(str(outputs_dir / "alpha.wav"))
++        _touch_wav(str(outputs_dir / "beta.wav"))
++        panel = HistoryPanel()
++        panel._search.setText("alpha")
++        visible = [panel._list.item(i).text() for i in range(panel._list.count())]
++        assert len(visible) == 1 and "alpha.wav" in visible[0]
++        panel._search.setText("")
++        assert panel._list.count() == 2
++        panel.deleteLater()
++
++    def test_refresh_picks_new_file(self, app, outputs_dir):
++        panel = HistoryPanel()
++        assert panel._list.item(0).text().startswith("(")
++        _touch_wav(str(outputs_dir / "late.wav"))
++        panel.refresh()
++        assert "late.wav" in panel._list.item(0).text()
++        panel.deleteLater()
+diff --git a/ai_studio_core/test/test_tts_flow_real.py b/ai_studio_core/test/test_tts_flow_real.py
+new file mode 100644
+index 0000000..92c092b
+--- /dev/null
++++ b/ai_studio_core/test/test_tts_flow_real.py
+@@ -0,0 +1,219 @@
++# -*- coding: utf-8 -*-
++"""Сквозные тесты TTS-контроллера с реальным espeak-бэкендом.
++
++Покрываем:
++  * полную цепочку генерация → реальный WAV → история → очередь;
++  * склейку нескольких чанков;
++  * RVC-гейт (честный отказ, без самообмана);
++  * отказ при недоступном бэкенде (без подделки);
++  * экспорт wav→mp3 через ffmpeg;
++  * очередь задач без демо-данных.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="контроллер — QObject")
++
++from PySide6.QtWidgets import QApplication
++
++from ai_studio_core import espeak_tts, paths
++
++pytestmark = pytest.mark.skipif(
++    not espeak_tts.available(), reason="espeak не установлен"
++)
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _wait(app, cond, timeout=30.0):
++    t0 = time.time()
++    while not cond() and time.time() - t0 < timeout:
++        app.processEvents()
++        time.sleep(0.02)
++    return cond()
++
++
++@pytest.fixture()
++def sandboxed_dirs(tmp_path, monkeypatch):
++    """Перенаправляем outputs/history в tmp — репозиторий не мусорим."""
++    out_dir = tmp_path / "outputs"
++    hist_path = tmp_path / "history.json"
++    monkeypatch.setattr(paths, "OUTPUT_DIR", str(out_dir))
++    import ai_studio_core.output_naming as on
++    import ai_studio_core.history_store as hs
++    monkeypatch.setattr(on, "OUTPUT_DIR", str(out_dir))
++    monkeypatch.setattr(hs, "HISTORY_PATH", str(hist_path))
++    return {"out": out_dir, "hist": hist_path}
++
++
++@pytest.fixture()
++def ctrl(app):
++    from ai_studio_core.ui.controllers.tts_controller import TTSController
++    return TTSController()
++
++
++class TestBackendDetection:
++    def test_backend_is_espeak_here(self, ctrl):
++        assert ctrl._ensure_backend()
++        assert ctrl.backend() == "espeak"
++
++    def test_no_backend_honest_error(self, ctrl, monkeypatch, app):
++        import ai_studio_core.ui.controllers.tts_controller as mod
++        monkeypatch.setattr(mod, "_detect_backend", lambda: None)
++        ctrl._backend = None
++        errors = []
++        ctrl.error_occurred.connect(errors.append)
++        ctrl.on_generate("Hello", {"language": "en"})
++        _wait(app, lambda: bool(errors), 5)
++        assert errors, "ожидали честную ошибку, а не молчание/подделку"
++
++
++class TestGenerationReal:
++    def test_single_chunk_flow(self, ctrl, sandboxed_dirs, app):
++        done, errors = {}, []
++        ctrl.generation_complete.connect(lambda p: done.update(path=p))
++        ctrl.error_occurred.connect(errors.append)
++        ctrl.on_generate("Hello, this is a real synthesis test.",
++                         {"language": "en", "speed": 1.0})
++        assert _wait(app, lambda: "path" in done, 30), f"errors={errors}"
++        path = done["path"]
++        assert os.path.exists(path)
++        assert path.endswith(".wav")
++        assert os.path.getsize(path) > 20_000
++        frames, rate, dur = espeak_tts.wav_info(path)
++        assert rate == 22050 and dur > 0.5
++        assert ctrl.last_output() == path
++
++    def test_pipeline_steps_reach_output(self, ctrl, sandboxed_dirs, app):
++        steps = []
++        done = []
++        ctrl.pipeline_step_changed.connect(lambda i, s: steps.append((i, s)))
++        ctrl.generation_complete.connect(lambda p: done.append(True))
++        ctrl.on_generate("Pipeline step coverage check.", {"language": "en"})
++        assert _wait(app, lambda: bool(done), 30)
++        assert (5, "done") in steps or (5, "active") in steps
++
++    def test_multi_chunk_concat(self, ctrl, sandboxed_dirs, app):
++        long_text = (
++            "This is a fairly long sentence that should be split into chunks. "
++            * 12
++        )
++        done = []
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate(long_text, {"language": "en", "speed": 1.3})
++        assert _wait(app, lambda: bool(done), 60)
++        frames, rate, dur = espeak_tts.wav_info(done[0])
++        assert dur > 3.0, "длинный текст должен дать заметную длительность"
++
++    def test_mp3_output_via_ffmpeg(self, ctrl, sandboxed_dirs, app):
++        pytest.importorskip("pydub")
++        done = []
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate("Export to mp3 check.",
++                         {"language": "en", "output_format": "mp3"})
++        assert _wait(app, lambda: bool(done), 30)
++        path = done[0]
++        assert path.endswith(".mp3")
++        assert os.path.getsize(path) > 1000
++
++    def test_history_recorded(self, ctrl, sandboxed_dirs, app):
++        done = []
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate("History persistence check.", {"language": "en"})
++        assert _wait(app, lambda: bool(done), 30)
++        hist = sandboxed_dirs["hist"]
++        assert hist.exists()
++        entries = json.loads(hist.read_text(encoding="utf-8"))
++        assert len(entries) >= 1
++        assert entries[0]["output"] == done[0]
++
++
++class TestRvcGate:
++    def test_rvc_enabled_honest_refusal(self, ctrl, app):
++        errors, done = [], []
++        ctrl.error_occurred.connect(errors.append)
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate("RVC request", {"language": "en", "rvc_enabled": True})
++        _wait(app, lambda: bool(errors), 5)
++        assert errors
++        assert not done, "не должны выдавать обычный синтез за RVC-конвертацию"
++
++
++class TestQueueIntegration:
++    def test_queue_starts_empty_no_demo(self, app):
++        from ai_studio_core.ui.controllers.queue_controller import QueueController
++        qc = QueueController()
++        assert qc.tasks() == [], "в очереди не должно быть вшитых демо-задач"
++
++    def test_task_lifecycle_real(self, ctrl, sandboxed_dirs, app):
++        from ai_studio_core.ui.controllers.queue_controller import QueueController
++        qc = QueueController()
++        ctrl.attach_queue(qc)
++        done = []
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate("Queue lifecycle check.", {"language": "en"})
++        assert _wait(app, lambda: bool(done), 30)
++        tasks = qc.tasks()
++        assert len(tasks) == 1
++        assert tasks[0].status == "done"
++        assert tasks[0].progress == 100
++        assert tasks[0].type == "TTS"
++        # очистка завершённых
++        qc.clear_completed()
++        assert qc.tasks() == []
++
++    def test_queue_cancel_marks_status(self, app):
++        from ai_studio_core.ui.controllers.queue_controller import QueueController
++        qc = QueueController()
++        tid = qc.add_task("TTS", "espeak")
++        qc.cancel_task(tid)
++        assert qc.tasks()[0].status == "cancelled"
++
++
++class TestExport:
++    def test_export_same_format_copy(self, ctrl, sandboxed_dirs, app, tmp_path):
++        done = []
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate("Export same-format copy check.", {"language": "en"})
++        assert _wait(app, lambda: bool(done), 30)
++        target = str(tmp_path / "copy.wav")
++        out = ctrl.export_last(target)
++        assert os.path.exists(out)
++        assert os.path.getsize(out) == os.path.getsize(done[0])
++
++    def test_export_without_generation_fails(self, app, tmp_path):
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        fresh = TTSController()
++        with pytest.raises(RuntimeError, match="no generated audio"):
++            fresh.export_last(str(tmp_path / "x.wav"))
++
++    def test_export_target_needs_extension(self, ctrl, sandboxed_dirs, app, tmp_path):
++        done = []
++        ctrl.generation_complete.connect(lambda p: done.append(p))
++        ctrl.on_generate("Extension validation check.", {"language": "en"})
++        assert _wait(app, lambda: bool(done), 30)
++        with pytest.raises(ValueError):
++            ctrl.export_last(str(tmp_path / "noext") + os.sep)
++
++
++class TestCancellation:
++    def test_aborted_marks_queue_cancelled(self, ctrl, app):
++        from ai_studio_core.ui.controllers.queue_controller import QueueController
++        qc = QueueController()
++        ctrl.attach_queue(qc)
++        tid = qc.add_task("TTS", "espeak")
++        ctrl._task_id = tid
++        out = ctrl._aborted()
++        assert out == ""
++        assert qc.tasks()[0].status == "cancelled"
+diff --git a/ai_studio_core/test/test_waveform_real.py b/ai_studio_core/test/test_waveform_real.py
+new file mode 100644
+index 0000000..b90f228
+--- /dev/null
++++ b/ai_studio_core/test/test_waveform_real.py
+@@ -0,0 +1,122 @@
++# -*- coding: utf-8 -*-
++"""Тесты виджета волны: реальные пики из WAV + обновление транспорта."""
++from __future__ import annotations
++
++import math
++import os
++import struct
++import wave
++
++import pytest
++
++from ai_studio_core import espeak_tts
++from ai_studio_core.ui.widgets.waveform_view import (
++    compute_peaks, wav_duration, _fmt_time,
++)
++
++
++def _write_sine_wav(path: str, freq: float = 440.0, seconds: float = 1.0,
++                    rate: int = 22050) -> None:
++    n = int(rate * seconds)
++    with wave.open(path, "wb") as wf:
++        wf.setnchannels(1)
++        wf.setsampwidth(2)
++        wf.setframerate(rate)
++        frames = b"".join(
++            struct.pack("<h", int(20000 * math.sin(2 * math.pi * freq * i / rate)))
++            for i in range(n)
++        )
++        wf.writeframes(frames)
++
++
++class TestComputePeaks:
++    def test_sine_peaks_uniform(self, tmp_path):
++        p = str(tmp_path / "sine.wav")
++        _write_sine_wav(p)
++        peaks = compute_peaks(p, buckets=100)
++        assert len(peaks) == 100
++        assert all(0.0 <= x <= 1.0 for x in peaks)
++        # синус стабилен: почти все корзины близки к 1
++        assert min(peaks) > 0.8
++        assert max(peaks) == pytest.approx(1.0)
++
++    def test_peaks_shape_follows_amplitude(self, tmp_path):
++        """Первая половина тихая, вторая громкая — пики это отражают."""
++        p = str(tmp_path / "step.wav")
++        rate = 22050
++        n = rate  # 1 секунда
++        frames = bytearray()
++        for i in range(n):
++            amp = 1000 if i < n // 2 else 30000
++            frames += struct.pack("<h", int(amp * math.sin(2 * math.pi * 440 * i / rate)))
++        with wave.open(p, "wb") as wf:
++            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
++            wf.writeframes(bytes(frames))
++        peaks = compute_peaks(p, buckets=20)
++        assert max(peaks[:10]) < 0.1          # тихая половина
++        assert peaks[-1] > 0.9                # громкая — у потолка
++
++    def test_zero_length_rejected(self, tmp_path):
++        p = str(tmp_path / "empty.wav")
++        with wave.open(p, "wb") as wf:
++            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(22050)
++            wf.writeframes(b"")
++        with pytest.raises(ValueError):
++            compute_peaks(p)
++
++    def test_real_speech_peaks(self, tmp_path):
++        if not espeak_tts.available():
++            pytest.skip("espeak не установлен")
++        out = str(tmp_path / "speech.wav")
++        espeak_tts.synthesize("Waveform peaks test sentence.", out_path=out)
++        peaks = compute_peaks(out)
++        assert len(peaks) == 160
++        assert max(peaks) == pytest.approx(1.0)
++        assert any(p < 0.5 for p in peaks)  # в речи есть паузы/тишина
++
++
++class TestDuration:
++    def test_wav_duration(self, tmp_path):
++        p = str(tmp_path / "d.wav")
++        _write_sine_wav(p, seconds=2.0)
++        assert wav_duration(p) == pytest.approx(2.0, abs=0.02)
++
++    def test_fmt_time(self):
++        assert _fmt_time(0) == "00:00"
++        assert _fmt_time(61.4) == "01:01"
++        assert _fmt_time(3600) == "60:00"
++
++
++class TestWaveformWidgetOffscreen:
++    @pytest.fixture(scope="class")
++    def app(self):
++        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++        pytest.importorskip("PySide6")
++        from PySide6.QtWidgets import QApplication
++        application = QApplication.instance() or QApplication([])
++        yield application
++
++    def test_set_audio_updates_view(self, app, tmp_path):
++        from ai_studio_core.ui.widgets.waveform_view import WaveformView
++        p = str(tmp_path / "sine.wav")
++        _write_sine_wav(p, seconds=3.0)
++        w = WaveformView()
++        peaks = w.set_audio(p)
++        assert len(peaks) == 160
++        assert w.current_path() == p
++        assert w.has_audio()
++        assert w._time_total.text() == "00:03"
++        assert w._canvas.peaks() == peaks
++
++    def test_play_button_disabled_without_backend_or_player(self, app, tmp_path):
++        """В offscreen-среде мультимедиа-бэкенда может не быть — тогда кнопка
++        честно отключена; файл тем не менее проигрываем там, где бэкенд есть."""
++        from ai_studio_core.ui.widgets.waveform_view import WaveformView
++        p = str(tmp_path / "sine.wav")
++        _write_sine_wav(p)
++        w = WaveformView()
++        w.set_audio(p)
++        if w._player is None:
++            assert not w._btn_play.isEnabled()
++        else:
++            assert w._btn_play.isEnabled()
+diff --git a/ui_workspace_tts_real.png b/ui_workspace_tts_real.png
+new file mode 100644
+index 0000000..028c167
+Binary files /dev/null and b/ui_workspace_tts_real.png differ

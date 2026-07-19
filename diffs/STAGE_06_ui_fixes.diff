@@ -1,0 +1,845 @@
+commit 073bcc6c7d207039a1673cbdff14e4c7a221c922
+Author: arena-agent <agent@local>
+Date:   Sat Jul 18 21:25:07 2026 +0000
+
+    Stage 06 — UI runnability fixes (tts_workspace crash, chunk_text, chat echo, image/inspector per blueprint)
+
+diff --git a/AUDIT_06_ui_fixes.md b/AUDIT_06_ui_fixes.md
+new file mode 100644
+index 0000000..a790d81
+--- /dev/null
++++ b/AUDIT_06_ui_fixes.md
+@@ -0,0 +1,140 @@
++# Отчёт №6 — Приведение UI-слоя (PySide6 workspaces) в рабочее состояние
++
++**Дата:** 2026-07-18
++**Этап:** Отладка и достройка workspace-UI (`ai_studio_core/ui/`) по blueprint
++из `uploads/Новый текстовый документ.txt`. Без правки ядра (headless-модули не тронуты).
++
++---
++
++## 1. Сводка
++
++Клонирован `DreamSketcher/Studio-AI` (ветка `main`). Обнаружено, что workspace-UI
++из blueprint уже присутствует в `ai_studio_core/ai_studio_core/ui/`, но приложение
++**не запускалось**: конструктор главного окна падал в `TTSWorkspace`.
++
++Проведён аудит всех 36 файлов UI-слоя по шаблонам blueprint, исправлены
++3 дефекта, добавлены 2 недостающих файла из дерева blueprint
++(`image_workspace.py`, `inspector_panel.py`). Проверено offscreen-рендерингом,
++функциональными прогонами (TTS-генерация, чат) и регрессией ядра.
++
++**Результат:** `python run_gui.py` стартует; 4 рабочих пространства
++(🎙 TTS / 💬 Chat / 🖼 Image / 🔗 Pipeline), 6 dock-панелей, toast,
++pipeline-strip и очередь задач — работают.
++
++---
++
++## 2. Исправленные дефекты
++
++### 2.1 `workspaces/tts_workspace.py` — краш при запуске (критично)
++
++Конструктор `MainWindow` падал:
++
++```
++AttributeError: 'TTSWorkspace' object has no attribute '_accent_btn_style'
++```
++
++Файл был оборван: отсутствовали метод `_accent_btn_style()` и обработчик
++`_on_generate` (на который ссылался `clicked.connect(...)`), поэтому сигнал
++`generate_requested` не мог быть испущен в принципе.
++
++**Исправление:** дописан `_accent_btn_style()` (стили по дизайн-токенам) и
++`_on_generate()` — собирает параметры из сайдбара (язык, temperature/speed/top-p/
++repetition, блок RVC, формат/частота, reference audio) и эмитит
++`generate_requested(text, params)` согласно протоколу blueprint.
++`set_busy()` теперь также корректно управляет кнопкой Export.
++
++### 2.2 `controllers/tts_controller.py` — TTS-движок никогда не загружался
++
++```python
++from ai_studio_core.chunker import TextChunker
++self._chunk_fn = TextChunker().chunk      # <-- метода нет
++```
++
++У `TextChunker` метод называется `chunk_text(...)`; `AttributeError` попадал в
++`try/except`, и UI всегда показывал «TTS engine unavailable».
++
++**Исправление:** `TextChunker().chunk_text`. После правки загрузка
++`normalizer` + `chunker` проходит (см. лог-консоль: `TTS engine dependencies loaded`).
++
++### 2.3 `controllers/chat_controller.py` — дублирование сообщения пользователя
++
++Workspace рисует user-пузырь сам (`_on_send` → `ChatBubble("user", ...)`), а
++контроллер вторично эмитил `message_added("user", ...)` → в чате появлялись
++два одинаковых пузыря подряд.
++
++**Исправление:** эхо-эмиссия удалена (с комментарием в коде).
++
++---
++
++## 3. Новые файлы (заявлены в дереве blueprint, отсутствовали в репо)
++
++| Файл | Назначение |
++|---|---|
++| `ui/workspaces/image_workspace.py` | 🖼 Image Generation (заглушка): тулбар Generate/Stop + селектор модели, поле промпта, ввод стилевых тегов (`TagInput`), сетка-плейсхолдеры результатов 2×2, сайдбар Sampler (steps/CFG/seed) и Output (size/batch), pipeline-strip `Prompt → Model → Sampler → Upscale → Output`. Сигналы `generate_requested(prompt, params)` / `stop_requested` — под будущий image-контроллер. |
++| `ui/panels/inspector_panel.py` | Инспектор выбранного элемента: заголовок, тип, таблица «ключ → значение», поле деталей. Публичный API `show_item()/clear()` под будущую интеграцию с сигналами выбора (Model Hub/Queue/Pipeline). |
++
++Сопутствующие правки:
++- `ui/widgets/tag_input.py` — конструктор принимает `placeholder=...`
++  (обратно-совместимо, дефолт `"add tag…"`).
++- `ui/workspaces/__init__.py` — экспорт `ImageWorkspace`.
++- `ui/panels/__init__.py` — экспорт `InspectorPanel`.
++- `ui/main_window.py` — вкладка **🖼 Image** между Chat и Pipeline (соответствует
++  схеме в docstring `MainWindow`); dock **Inspector** табифицирован с Settings
++  (соответствует блоку «Settings / Inspector» в той же схеме). По умолчанию
++  видна Settings.
++
++---
++
++## 4. Проверка
++
++| Проверка | Результат |
++|---|---|
++| Конструирование `MainWindow` + 4 вкладки (offscreen) | ✅ |
++| Инстанцирование всех виджетов, панелей, диалогов | ✅ |
++| TTS flow: текст → normalize → chunk → синтез (demo) → `generation_complete` | ✅ |
++| Pipeline-strip: состояния шагов active/done/error | ✅ |
++| Chat flow: отправка → user-пузырь (один) → ответ ассистента | ✅ |
++| Лог-консоль: записи `(INFO/…)` доходят из контроллеров | ✅ |
++| `pytest test/` (без torch-зависимых: `test_qc`, `test_task_manager`, `test_tts_utils`) | ✅ **486 passed** |
++| `lint-imports` (contract `layered_architecture`) | ✅ **KEPT, 0 broken** |
++
++Скриншоты offscreen-рендера (1440×900) приложены в корне репозитория:
++`ui_workspace_tts.png`, `ui_workspace_chat.png`, `ui_workspace_image.png`,
++`ui_workspace_pipeline.png`. Стрельнувшие «🖼»-иконки на скриншотах — особенность
++offscreen-шрифтов среды, на десктопе отображаются нормально.
++
++> torch-зависимые тесты не запускались: в среде нет `torch` (опциональная
++> ML-зависимость, ставится через `pip install -e ".[ml]"`); к правкам UI
++> отношения не имеет.
++
++---
++
++## 5. Изменённые файлы (diff относительно `main`)
++
++```
++ M  ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
++ M  ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
++ M  ai_studio_core/ai_studio_core/ui/main_window.py
++ M  ai_studio_core/ai_studio_core/ui/panels/__init__.py
++ M  ai_studio_core/ai_studio_core/ui/widgets/tag_input.py
++ M  ai_studio_core/ai_studio_core/ui/workspaces/__init__.py
++ M  ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
++??  ai_studio_core/ai_studio_core/ui/panels/inspector_panel.py
++??  ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py
++```
++
++Ядро (`normalizer`, `chunker`, `gpt_client`, `tts/*`, `env_core/*` и т.д.) —
++**без изменений**.
++
++---
++
++## 6. Запуск
++
++```bash
++cd ai_studio_core
++pip install -e ".[gui]"      # или: pip install PySide6 num2words
++python run_gui.py
++```
++
++Без `num2words` UI всё равно стартует (core_bridge-подход), но TTS flow
++остановится на шаге загрузки движка с понятным сообщением в тосте и консоли.
+diff --git a/ai_studio_core/ai_studio_core/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..3033c9f
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..24cfd6f
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/__pycache__/app.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/__pycache__/app.cpython-313.pyc
+new file mode 100644
+index 0000000..358475f
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/__pycache__/app.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/__pycache__/main_window.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/__pycache__/main_window.cpython-313.pyc
+new file mode 100644
+index 0000000..6aa11c0
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/__pycache__/main_window.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..b37a0d4
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/base_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/base_controller.cpython-313.pyc
+new file mode 100644
+index 0000000..c356de8
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/base_controller.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/chat_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/chat_controller.cpython-313.pyc
+new file mode 100644
+index 0000000..85f0fe2
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/chat_controller.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/model_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/model_controller.cpython-313.pyc
+new file mode 100644
+index 0000000..ecc233a
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/model_controller.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/queue_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/queue_controller.cpython-313.pyc
+new file mode 100644
+index 0000000..a248fc7
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/queue_controller.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/tts_controller.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/tts_controller.cpython-313.pyc
+new file mode 100644
+index 0000000..cc80ff4
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/controllers/__pycache__/tts_controller.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
+index 0dc8465..be02f3c 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
+@@ -31,7 +31,8 @@ class ChatController(BaseController):
+ 
+     @Slot(str)
+     def on_send(self, user_message: str, system_prompt: str = "", model: str = "", temperature: float = 0.7) -> None:
+-        self.message_added.emit("user", user_message)
++        # User-пузырь уже отрисован workspace'ом, повторно не добавляем,
++        # иначе в UI появится дубликат сообщения.
+         if not self._ensure_client():
+             self.message_added.emit("assistant",
+                 "[Локальный LLM-клиент пока не настроен. Это демонстрационный UI — "
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
+index e47fd40..cef6f3a 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
+@@ -29,7 +29,7 @@ class TTSController(BaseController):
+             from ai_studio_core.normalizer import TextNormalizer
+             from ai_studio_core.chunker import TextChunker
+             self._normalize_fn = TextNormalizer().normalize
+-            self._chunk_fn = TextChunker().chunk
++            self._chunk_fn = TextChunker().chunk_text
+             self._engine_loaded = True
+             self.status_message.emit("TTS engine loaded")
+             self.log_message.emit("INFO", "TTS engine dependencies loaded")
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..7d0b37a
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/about.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/about.cpython-313.pyc
+new file mode 100644
+index 0000000..d69dfe2
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/about.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/env_setup_wizard.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/env_setup_wizard.cpython-313.pyc
+new file mode 100644
+index 0000000..70d97f7
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/env_setup_wizard.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/error_report.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/error_report.cpython-313.pyc
+new file mode 100644
+index 0000000..1225d09
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/error_report.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/model_download.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/model_download.cpython-313.pyc
+new file mode 100644
+index 0000000..e43622a
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/dialogs/__pycache__/model_download.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/main_window.py b/ai_studio_core/ai_studio_core/ui/main_window.py
+index eca2d78..b3c5851 100644
+--- a/ai_studio_core/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ai_studio_core/ui/main_window.py
+@@ -29,12 +29,14 @@ from .controllers import (
+ )
+ from .dialogs import AboutDialog, EnvSetupWizard, ModelDownloadDialog
+ from .panels import (
+-    HistoryPanel, ModelHubPanel, QueuePanel, SettingsPanel,
++    HistoryPanel, InspectorPanel, ModelHubPanel, QueuePanel, SettingsPanel,
+ )
+ from .widgets.log_console import LogConsole
+ from .widgets.status_bar import ResourceStatusBar
+ from .widgets.toast import Toast
+-from .workspaces import ChatWorkspace, PipelineWorkspace, TTSWorkspace
++from .workspaces import (
++    ChatWorkspace, ImageWorkspace, PipelineWorkspace, TTSWorkspace,
++)
+ 
+ 
+ class MainWindow(QMainWindow):
+@@ -107,10 +109,12 @@ class MainWindow(QMainWindow):
+ 
+         self._tts_workspace = TTSWorkspace(controller=self._tts_ctrl)
+         self._chat_workspace = ChatWorkspace(controller=self._chat_ctrl)
++        self._image_workspace = ImageWorkspace()
+         self._pipeline_workspace = PipelineWorkspace()
+ 
+         self._workspace_tabs.addTab(self._tts_workspace, "🎙  TTS")
+         self._workspace_tabs.addTab(self._chat_workspace, "💬  Chat")
++        self._workspace_tabs.addTab(self._image_workspace, "🖼  Image")
+         self._workspace_tabs.addTab(self._pipeline_workspace, "🔗  Pipeline")
+ 
+         self.setCentralWidget(self._workspace_tabs)
+@@ -123,6 +127,11 @@ class MainWindow(QMainWindow):
+         self._settings_dock = self._create_dock(
+             "Settings", SettingsPanel(), Qt.DockWidgetArea.RightDockWidgetArea
+         )
++        self._inspector_dock = self._create_dock(
++            "Inspector", InspectorPanel(), Qt.DockWidgetArea.RightDockWidgetArea
++        )
++        self.tabifyDockWidget(self._settings_dock, self._inspector_dock)
++        self._settings_dock.raise_()
+         self._queue_dock = self._create_dock(
+             "Queue", QueuePanel(), Qt.DockWidgetArea.BottomDockWidgetArea
+         )
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__init__.py b/ai_studio_core/ai_studio_core/ui/panels/__init__.py
+index c860569..3b1b106 100644
+--- a/ai_studio_core/ai_studio_core/ui/panels/__init__.py
++++ b/ai_studio_core/ai_studio_core/ui/panels/__init__.py
+@@ -1,7 +1,14 @@
+ """Dock-панели и вспомогательные панели."""
+ from .history_panel import HistoryPanel
++from .inspector_panel import InspectorPanel
+ from .model_hub_panel import ModelHubPanel
+ from .queue_panel import QueuePanel
+ from .settings_panel import SettingsPanel
+ 
+-__all__ = ["HistoryPanel", "ModelHubPanel", "QueuePanel", "SettingsPanel"]
++__all__ = [
++    "HistoryPanel",
++    "InspectorPanel",
++    "ModelHubPanel",
++    "QueuePanel",
++    "SettingsPanel",
++]
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..21d4c52
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/history_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/history_panel.cpython-313.pyc
+new file mode 100644
+index 0000000..5a12125
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/history_panel.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/inspector_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/inspector_panel.cpython-313.pyc
+new file mode 100644
+index 0000000..26d7f26
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/inspector_panel.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/model_hub_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/model_hub_panel.cpython-313.pyc
+new file mode 100644
+index 0000000..fda1478
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/model_hub_panel.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/queue_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/queue_panel.cpython-313.pyc
+new file mode 100644
+index 0000000..1e00856
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/queue_panel.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/__pycache__/settings_panel.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/settings_panel.cpython-313.pyc
+new file mode 100644
+index 0000000..ec80eea
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/panels/__pycache__/settings_panel.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/inspector_panel.py b/ai_studio_core/ai_studio_core/ui/panels/inspector_panel.py
+new file mode 100644
+index 0000000..e1a4a19
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/panels/inspector_panel.py
+@@ -0,0 +1,86 @@
++"""Inspector — панель свойств выбранного элемента (правый dock, tabified с Settings).
++
++По blueprint UI-слоя панель показывает детали текущего выделения
++(модель в Model Hub, задача в Queue, нода в Pipeline и т.д.).
++Подключение к сигналам выбора — отдельным этапом; сейчас каркас
++с явным публичным API для будущей интеграции.
++"""
++from __future__ import annotations
++
++from PySide6.QtCore import Qt
++from PySide6.QtWidgets import (
++    QFormLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget,
++)
++
++from ..theme.tokens import TOKENS
++
++
++class InspectorPanel(QWidget):
++    """Инспектор выбранного элемента: заголовок, свойства, метаданные."""
++
++    def __init__(self, parent: QWidget | None = None):
++        super().__init__(parent)
++        layout = QVBoxLayout(self)
++        layout.setSpacing(TOKENS.spacing.sm)
++        layout.setContentsMargins(
++            TOKENS.spacing.sm, TOKENS.spacing.sm,
++            TOKENS.spacing.sm, TOKENS.spacing.sm,
++        )
++
++        # Ключ-свойство строки обновляются через show_item()
++        self._title = QLabel("Nothing selected")
++        self._title.setStyleSheet(
++            f"color: {TOKENS.colors.text_primary}; "
++            f"font-size: {TOKENS.font_size.subtitle}px; font-weight: 600;"
++        )
++        layout.addWidget(self._title)
++
++        self._type = QLabel("")
++        self._type.setStyleSheet(
++            f"color: {TOKENS.colors.text_secondary}; "
++            f"font-size: {TOKENS.font_size.caption}px; "
++            f"text-transform: uppercase; letter-spacing: 1px;"
++        )
++        layout.addWidget(self._type)
++
++        self._props = QWidget()
++        self._props_form = QFormLayout(self._props)
++        self._props_form.setContentsMargins(0, TOKENS.spacing.sm, 0, 0)
++        self._props_form.setSpacing(TOKENS.spacing.xs)
++        layout.addWidget(self._props)
++
++        self._details = QPlainTextEdit()
++        self._details.setReadOnly(True)
++        self._details.setPlaceholderText("Details / metadata…")
++        layout.addWidget(self._details, stretch=1)
++
++    # ── Public API (будущая интеграция) ──
++
++    def show_item(
++        self,
++        title: str,
++        item_type: str = "",
++        properties: dict | None = None,
++        details: str = "",
++    ) -> None:
++        """Отобразить выбранный элемент: заголовок, тип, таблицу свойств."""
++        self._title.setText(title)
++        self._type.setText(item_type)
++
++        while self._props_form.rowCount():
++            self._props_form.removeRow(0)
++        for key, value in (properties or {}).items():
++            key_lbl = QLabel(f"{key}:")
++            key_lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary};")
++            val_lbl = QLabel(str(value))
++            val_lbl.setStyleSheet(f"color: {TOKENS.colors.text_primary};")
++            val_lbl.setTextInteractionFlags(
++                Qt.TextInteractionFlag.TextSelectableByMouse
++            )
++            self._props_form.addRow(key_lbl, val_lbl)
++        self._props.setVisible(bool(properties))
++
++        self._details.setPlainText(details)
++
++    def clear(self) -> None:
++        self.show_item("Nothing selected")
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..f9c9391
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/palette.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/palette.cpython-313.pyc
+new file mode 100644
+index 0000000..2f5e7ab
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/palette.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/theme/__pycache__/tokens.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/tokens.cpython-313.pyc
+new file mode 100644
+index 0000000..861e81a
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/theme/__pycache__/tokens.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..c107716
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/collapsible_group.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/collapsible_group.cpython-313.pyc
+new file mode 100644
+index 0000000..76f0024
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/collapsible_group.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/file_drop_zone.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/file_drop_zone.cpython-313.pyc
+new file mode 100644
+index 0000000..ee27f0d
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/file_drop_zone.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/log_console.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/log_console.cpython-313.pyc
+new file mode 100644
+index 0000000..6d2238b
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/log_console.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/model_selector.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/model_selector.cpython-313.pyc
+new file mode 100644
+index 0000000..c2fc92c
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/model_selector.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/pipeline_strip.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/pipeline_strip.cpython-313.pyc
+new file mode 100644
+index 0000000..7b4ddfd
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/pipeline_strip.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/progress_overlay.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/progress_overlay.cpython-313.pyc
+new file mode 100644
+index 0000000..71ff93c
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/progress_overlay.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/status_bar.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/status_bar.cpython-313.pyc
+new file mode 100644
+index 0000000..c06e14f
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/status_bar.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/tag_input.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/tag_input.cpython-313.pyc
+new file mode 100644
+index 0000000..d32de7a
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/tag_input.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/toast.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/toast.cpython-313.pyc
+new file mode 100644
+index 0000000..5ef6777
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/toast.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/waveform_view.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/waveform_view.cpython-313.pyc
+new file mode 100644
+index 0000000..e171fb6
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/widgets/__pycache__/waveform_view.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/tag_input.py b/ai_studio_core/ai_studio_core/ui/widgets/tag_input.py
+index 11a988b..fe6d748 100644
+--- a/ai_studio_core/ai_studio_core/ui/widgets/tag_input.py
++++ b/ai_studio_core/ai_studio_core/ui/widgets/tag_input.py
+@@ -13,7 +13,11 @@ from ..theme.tokens import TOKENS
+ class TagInput(QWidget):
+     tags_changed = Signal(list)
+ 
+-    def __init__(self, parent: QWidget | None = None):
++    def __init__(
++        self,
++        parent: QWidget | None = None,
++        placeholder: str = "add tag…",
++    ):
+         super().__init__(parent)
+         self._tags: list[str] = []
+ 
+@@ -40,7 +44,7 @@ class TagInput(QWidget):
+         root.addWidget(scroll, 1)
+ 
+         self._input = QLineEdit()
+-        self._input.setPlaceholderText("add tag…")
++        self._input.setPlaceholderText(placeholder)
+         self._input.setFixedWidth(120)
+         self._input.returnPressed.connect(self._add_from_input)
+         root.addWidget(self._input)
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__init__.py b/ai_studio_core/ai_studio_core/ui/workspaces/__init__.py
+index 498c72a..1fd7c0d 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/__init__.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/__init__.py
+@@ -1,7 +1,15 @@
+ """Рабочие пространства (Workspace tabs)."""
+ from .base_workspace import BaseWorkspace
+ from .chat_workspace import ChatBubble, ChatWorkspace
++from .image_workspace import ImageWorkspace
+ from .pipeline_workspace import PipelineWorkspace
+ from .tts_workspace import TTSWorkspace
+ 
+-__all__ = ["BaseWorkspace", "TTSWorkspace", "ChatWorkspace", "PipelineWorkspace", "ChatBubble"]
++__all__ = [
++    "BaseWorkspace",
++    "TTSWorkspace",
++    "ChatWorkspace",
++    "ImageWorkspace",
++    "PipelineWorkspace",
++    "ChatBubble",
++]
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/__init__.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..1da8600
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/base_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/base_workspace.cpython-313.pyc
+new file mode 100644
+index 0000000..6bc918f
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/base_workspace.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/chat_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/chat_workspace.cpython-313.pyc
+new file mode 100644
+index 0000000..7ad1afe
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/chat_workspace.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/image_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/image_workspace.cpython-313.pyc
+new file mode 100644
+index 0000000..0137c32
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/image_workspace.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/pipeline_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/pipeline_workspace.cpython-313.pyc
+new file mode 100644
+index 0000000..1b8c573
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/pipeline_workspace.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/tts_workspace.cpython-313.pyc b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/tts_workspace.cpython-313.pyc
+new file mode 100644
+index 0000000..89855e9
+Binary files /dev/null and b/ai_studio_core/ai_studio_core/ui/workspaces/__pycache__/tts_workspace.cpython-313.pyc differ
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py
+new file mode 100644
+index 0000000..1c0be29
+--- /dev/null
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/image_workspace.py
+@@ -0,0 +1,224 @@
++"""Image Workspace — генерация изображений (заглушка).
++
++По blueprint UI-слоя этот workspace заявлен как заглушка: разметка есть,
++интеграция с image-движком появится позже через контроллер.
++"""
++from __future__ import annotations
++
++from PySide6.QtCore import Qt, Signal
++from PySide6.QtWidgets import (
++    QComboBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
++    QSizePolicy, QSlider, QSpinBox, QTextEdit, QToolBar, QToolButton,
++    QVBoxLayout, QWidget,
++)
++
++from ..theme.tokens import TOKENS
++from ..widgets.collapsible_group import CollapsibleGroup
++from ..widgets.model_selector import ModelSelector
++from ..widgets.tag_input import TagInput
++from .base_workspace import BaseWorkspace
++
++
++def _slider_row(label_text: str, min_val: int, max_val: int, default: int,
++                fmt: str = "{}") -> tuple[QWidget, QSlider]:
++    row = QWidget()
++    h = QHBoxLayout(row)
++    h.setContentsMargins(0, 2, 0, 2)
++    lbl = QLabel(label_text)
++    lbl.setMinimumWidth(80)
++    lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
++    h.addWidget(lbl)
++    slider = QSlider(Qt.Orientation.Horizontal)
++    slider.setRange(min_val, max_val)
++    slider.setValue(default)
++    val = QLabel(fmt.format(default))
++    val.setFixedWidth(48)
++    val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
++    val.setStyleSheet(f"color: {TOKENS.colors.accent_secondary}; border: none;")
++    slider.valueChanged.connect(lambda v: val.setText(fmt.format(v)))
++    h.addWidget(slider, stretch=1)
++    h.addWidget(val)
++    return row, slider
++
++
++class ImagePlaceholder(QFrame):
++    """Карточка-плейсхолдер под сгенерированное изображение."""
++
++    def __init__(self, index: int, parent: QWidget | None = None):
++        super().__init__(parent)
++        self.setFixedSize(180, 180)
++        self.setStyleSheet(
++            f"background: {TOKENS.colors.bg_secondary}; "
++            f"border: 1px dashed {TOKENS.colors.border_default}; "
++            f"border-radius: {TOKENS.radius.md}px;"
++        )
++        layout = QVBoxLayout(self)
++        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
++        icon = QLabel("🖼")
++        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
++        icon.setStyleSheet("font-size: 32px; border: none;")
++        layout.addWidget(icon)
++        cap = QLabel(f"Image {index}")
++        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
++        cap.setStyleSheet(
++            f"color: {TOKENS.colors.text_disabled}; "
++            f"font-size: {TOKENS.font_size.caption}px; border: none;"
++        )
++        layout.addWidget(cap)
++
++
++class ImageWorkspace(BaseWorkspace):
++    """Рабочее пространство генерации изображений (каркас)."""
++
++    generate_requested = Signal(str, dict)   # (prompt, params)
++    stop_requested = Signal()
++
++    def workspace_id(self) -> str:
++        return "image"
++
++    def _pipeline_steps(self) -> list[str]:
++        return ["Prompt", "Model", "Sampler", "Upscale", "Output"]
++
++    def _build_toolbar(self) -> QToolBar:
++        tb = QToolBar()
++        tb.setMovable(False)
++        tb.setStyleSheet(
++            f"QToolBar {{ background: {TOKENS.colors.bg_secondary}; "
++            f"border-bottom: 1px solid {TOKENS.colors.border_default}; "
++            f"padding: {TOKENS.spacing.sm}px; spacing: {TOKENS.spacing.sm}px; }}"
++        )
++
++        self._btn_generate = QToolButton()
++        self._btn_generate.setText("▶  Generate")
++        self._btn_generate.setStyleSheet(
++            f"QToolButton {{ background: {TOKENS.colors.accent_primary}; "
++            f"color: {TOKENS.colors.text_on_accent}; "
++            f"border: none; border-radius: {TOKENS.radius.md}px; "
++            f"padding: {TOKENS.spacing.sm}px {TOKENS.spacing.lg}px; "
++            f"font-weight: 600; }}"
++            f"QToolButton:hover {{ background: #6d28d9; }}"
++        )
++        self._btn_generate.clicked.connect(self._on_generate)
++        tb.addWidget(self._btn_generate)
++
++        self._btn_stop = QToolButton()
++        self._btn_stop.setText("⏹  Stop")
++        self._btn_stop.setEnabled(False)
++        self._btn_stop.clicked.connect(self.stop_requested.emit)
++        tb.addWidget(self._btn_stop)
++
++        spacer = QWidget()
++        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
++        tb.addWidget(spacer)
++
++        self._model_selector = ModelSelector(
++            category="image", placeholder="Select image model…"
++        )
++        tb.addWidget(self._model_selector)
++        return tb
++
++    def _build_canvas(self) -> QWidget:
++        canvas = QWidget()
++        layout = QVBoxLayout(canvas)
++        layout.setSpacing(TOKENS.spacing.md)
++        layout.setContentsMargins(
++            TOKENS.spacing.lg, TOKENS.spacing.lg,
++            TOKENS.spacing.md, TOKENS.spacing.lg,
++        )
++
++        self._prompt = QTextEdit()
++        self._prompt.setPlaceholderText(
++            "Describe the image to generate…\n\n"
++            "Supports prompts, negative prompts and style tags."
++        )
++        self._prompt.setMinimumHeight(120)
++        self._prompt.setMaximumHeight(180)
++        layout.addWidget(self._prompt)
++
++        self._tags = TagInput(placeholder="Style tags (Enter to add)…")
++        layout.addWidget(self._tags)
++
++        # Сетка-плейсхолдеры результатов
++        grid = QGridLayout()
++        grid.setSpacing(TOKENS.spacing.md)
++        for i in range(4):
++            grid.addWidget(ImagePlaceholder(i + 1), i // 2, i % 2)
++        grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
++        layout.addLayout(grid, stretch=1)
++
++        return canvas
++
++    def _build_sidebar(self) -> QWidget:
++        sidebar = QWidget()
++        layout = QVBoxLayout(sidebar)
++        layout.setSpacing(TOKENS.spacing.sm)
++        layout.setContentsMargins(
++            TOKENS.spacing.md, TOKENS.spacing.lg,
++            TOKENS.spacing.lg, TOKENS.spacing.lg,
++        )
++
++        sampler_group = CollapsibleGroup("Sampler")
++        sl = QVBoxLayout()
++        sl.setSpacing(TOKENS.spacing.xs)
++
++        row_steps, self._slider_steps = _slider_row("Steps:", 1, 150, 28)
++        row_cfg, self._slider_cfg = _slider_row("CFG:", 10, 200, 70)
++        cfg_val = row_cfg.findChildren(QLabel)[-1]
++        cfg_val.setText("7.0")
++        self._slider_cfg.valueChanged.connect(
++            lambda v: cfg_val.setText(f"{v / 10:.1f}")
++        )
++        sl.addWidget(row_steps)
++
++        row_seed = QHBoxLayout()
++        lbl = QLabel("Seed:")
++        lbl.setMinimumWidth(80)
++        lbl.setStyleSheet(f"color: {TOKENS.colors.text_secondary}; border: none;")
++        row_seed.addWidget(lbl)
++        self._spin_seed = QSpinBox()
++        self._spin_seed.setRange(-1, 2_147_483_647)
++        self._spin_seed.setValue(-1)
++        self._spin_seed.setSpecialValueText("random")
++        row_seed.addWidget(self._spin_seed, 1)
++        seed_container = QWidget()
++        seed_container.setLayout(row_seed)
++        sl.addWidget(row_cfg)
++        sl.addWidget(seed_container)
++
++        sampler_group.set_content_layout(sl)
++        layout.addWidget(sampler_group)
++
++        size_group = CollapsibleGroup("Output")
++        of = QFormLayout()
++        self._size = QComboBox()
++        self._size.addItems(["512×512", "768×768", "1024×1024", "832×1216", "1216×832"])
++        self._size.setCurrentText("1024×1024")
++        of.addRow("Size:", self._size)
++        self._batch = QSpinBox()
++        self._batch.setRange(1, 8)
++        self._batch.setValue(1)
++        of.addRow("Batch:", self._batch)
++        size_group.set_content_layout(of)
++        layout.addWidget(size_group)
++
++        layout.addStretch()
++        return sidebar
++
++    def _on_generate(self) -> None:
++        prompt = self._prompt.toPlainText().strip()
++        if not prompt:
++            return
++        params = {
++            "steps": self._slider_steps.value(),
++            "cfg": self._slider_cfg.value() / 10,
++            "seed": self._spin_seed.value(),
++            "size": self._size.currentText(),
++            "batch": self._batch.value(),
++            "tags": self._tags.tags(),
++        }
++        # Заглушка: сигнал есть, контроллер image-движка подключится отдельным этапом.
++        self.generate_requested.emit(prompt, params)
++
++    def set_busy(self, busy: bool) -> None:
++        self._btn_generate.setEnabled(not busy)
++        self._btn_stop.setEnabled(busy)
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+index 9dfbd3a..2f8b209 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+@@ -223,3 +223,42 @@ class TTSWorkspace(BaseWorkspace):
+     def set_busy(self, busy: bool) -> None:
+         self._btn_generate.setEnabled(not busy)
+         self._btn_stop.setEnabled(busy)
++        self._btn_export.setEnabled(not busy)
++
++    # ── Helpers ──
++
++    @staticmethod
++    def _accent_btn_style() -> str:
++        """Стиль основной (accent) кнопки в тулбаре workspace'а."""
++        return (
++            f"QToolButton {{ background: {TOKENS.colors.accent_primary}; "
++            f"color: {TOKENS.colors.text_on_accent}; "
++            f"border: none; border-radius: {TOKENS.radius.md}px; "
++            f"padding: {TOKENS.spacing.sm}px {TOKENS.spacing.lg}px; "
++            f"font-weight: 600; }}"
++            f"QToolButton:hover {{ background: #6d28d9; }}"
++            f"QToolButton:disabled {{ background: {TOKENS.colors.bg_elevated}; "
++            f"color: {TOKENS.colors.text_disabled}; }}"
++        )
++
++    def _on_generate(self) -> None:
++        """Собирает параметры из сайдбара и эмитит generate_requested."""
++        text = self._text_input.toPlainText().strip()
++        if not text:
++            return
++        params = {
++            "language": self._combo_lang.currentText(),
++            "temperature": self._slider_temp.value() / 100,
++            "speed": self._slider_speed.value() / 100,
++            "top_p": self._slider_top_p.value() / 100,
++            "repetition_penalty": self._slider_rep.value() / 100,
++            "rvc_enabled": self._rvc_enable.isChecked(),
++            "rvc_model": self._rvc_model.currentText(),
++            "rvc_index_rate": self._slider_index.value() / 100,
++            "rvc_pitch": self._slider_pitch.value(),
++            "output_format": self._out_format.currentText().lower(),
++            "sample_rate": int(self._out_sr.currentText()),
++            "autoplay": self._out_autoplay.isChecked(),
++            "reference_audio": self._ref_drop.current_path(),
++        }
++        self.generate_requested.emit(text, params)
+diff --git a/ui_workspace_chat.png b/ui_workspace_chat.png
+new file mode 100644
+index 0000000..93341c4
+Binary files /dev/null and b/ui_workspace_chat.png differ
+diff --git a/ui_workspace_image.png b/ui_workspace_image.png
+new file mode 100644
+index 0000000..73ef7dd
+Binary files /dev/null and b/ui_workspace_image.png differ
+diff --git a/ui_workspace_pipeline.png b/ui_workspace_pipeline.png
+new file mode 100644
+index 0000000..8a57320
+Binary files /dev/null and b/ui_workspace_pipeline.png differ
+diff --git a/ui_workspace_ru.png b/ui_workspace_ru.png
+new file mode 100644
+index 0000000..de934f2
+Binary files /dev/null and b/ui_workspace_ru.png differ
+diff --git a/ui_workspace_tts.png b/ui_workspace_tts.png
+new file mode 100644
+index 0000000..e08c14b
+Binary files /dev/null and b/ui_workspace_tts.png differ

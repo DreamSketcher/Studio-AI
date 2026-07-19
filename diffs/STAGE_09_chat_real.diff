@@ -1,0 +1,1452 @@
+commit 4dc542b9e5a93ba92d53ea9a74216b54f7c39b26
+Author: arena-agent <agent@local>
+Date:   Sat Jul 18 21:59:09 2026 +0000
+
+    Stage 09 — real chat (gpt_client wiring, provider/key settings, history), real model/backend selectors
+
+diff --git a/AUDIT_09_chat_real.md b/AUDIT_09_chat_real.md
+new file mode 100644
+index 0000000..723a084
+--- /dev/null
++++ b/AUDIT_09_chat_real.md
+@@ -0,0 +1,97 @@
++# Отчёт №9 — Реальный чат с LLM: провайдеры/ключи, история, выбор модели и TTS-бэкенда
++
++**Дата:** 2026-07-19
++**Этап:** Замена демо-чата на рабочую интеграцию с `gpt_client`. Без заглушек
++«насколько позволяет окружение»: у среды нет ни одного реального API-ключа —
++поэтому тесты ходят на **настоящий OpenAI-совместимый HTTP-сервер**, поднятый
++на loopback (127.0.0.1) — единственный адрес, для которого `gpt_client`
++разрешает `http://`.
++
++---
++
++## 1. Что было заглушкой → чем стало
++
++| Было | Стало |
++|---|---|
++| Чат молча ничего не делал / манекен-ответ | Реальный вызов `gpt_client.chat` в worker-потоке, история диалога, ответ в пузырь |
++| Селектор модели слал в контроллер декорированный текст «✅ name ✓ (provider)» → в `set_model` попадал мусор; `max_tokens` из сайдбара игнорировался | `send_requested` несёт честные `model_id` (userData) и `max_tokens` (int), оба проброшены в payload API |
++| `gpt_client`: `temperature`/`max_tokens` захардкожены (0.7/2048) | Параметры проведены: `chat() → _call_with_chain → _call_api → payload` |
++| Settings → нет управления LLM | Группа «LLM Provider»: список провайдеров (встроенные + кастомные), ввод API-ключа (Password echo), состояние ключа (задан/не задан), сохранение в `gpt_settings.json` через `secret_store` (ключ не в plaintext) |
++| `ModelSelector`: вшитые демо-списки («GPT-4o», «XTTS v2.0.2», «Male v2»…) | Стартует пустым; наполняется только реальными данными контроллеров: каталог активного LLM-провайдера, доступные TTS-движки, `.pth`-файлы на диске |
++| TTS-селектор декоративный | Реальный выбор движка: Auto / Coqui XTTS v2 / espeak-ng со статусами ✅/📥/❌ по факту окружения; закреплённый недоступный движок → явная ошибка `ctl_backend_missing`, файла-пустышки нет |
++| RVC-селектор — вшитые «Male v2 / Female v1» | Реальный рекурсивный скан `models/` на `*.pth`; пусто — честно пусто |
++
++## 2. Изменения по файлам
++
++### Ядро
++- **`gpt_client.py`** — `chat(prompt, history, system, max_tokens, temperature)`;
++  оба параметра доезжают до JSON-payload; у кастомных провайдеров — как у встроенных.
++- **`i18n.py`** — +8 ключей Settings→LLM (`set_llm`, `set_provider`, `set_api_key`,
++  `set_api_key_ph`, `set_save`, `set_key_state_ok/missing`, `set_key_saved`) на EN/RU;
++  +3 ключа селекторов (`model_auto`, `prov_engines`, `ctl_backend_missing`);
++  `ctl_llm_missing` переформулирован под реальный путь настройки.
++
++### UI
++- **`ui/widgets/model_selector.py`** — переписан: демо-заливка удалена;
++  `set_models()` пересобирает список **без ложной эмиссии** `model_changed`;
++  запись `current: True` подсвечивается программно; `current_model_id()`,
++  `select_id()` без сигнала.
++- **`ui/workspaces/chat_workspace.py`** — `send_requested(str,str,str,float,int)`;
++  публичные `set_models()/model_selector()`; sidebar-параметры честно едут в сигнал.
++- **`ui/workspaces/tts_workspace.py`** — акцессоры `model_selector()/rvc_selector()`;
++  `rvc_model` в params — id (путь), не label.
++- **`ui/controllers/chat_controller.py`** — переписан: история контроллера;
++  `available_models()` из каталога **активного** провайдера (ключ есть → ✅, нет → ❌);
++  `select_model()` персистит выбор; `on_send(message, system, model, temperature, max_tokens)`;
++  `AIUnavailable`/любой сбой → сообщение «⚠ …» в чат + статус, **фальшивых ответов нет**;
++  `on_clear()` очищает историю.
++- **`ui/controllers/tts_controller.py`** — `available_models()` (auto/coqui/espeak
++  со статусами из реального окружения), `select_backend()` (неизвестный id → WARN,
++  выбор не меняется), `_resolve_backend()` уважает закреплённый выбор,
++  `rvc_models()` — реальный скан `MODEL_DIR/**/*.pth`.
++- **`ui/panels/settings_panel.py`** — группа LLM Provider + сигнал `llm_saved`;
++  `_rebuild_providers()` без дублирования connect'ов; `retranslate_ui()`
++  перечитывает подписи провайдеров из `gpt_client` (живое RU/EN).
++- **`ui/main_window.py`** — проводка: `model_changed → select_model/select_backend`,
++  заливка селекторов при старте, `llm_saved → _on_llm_saved` (обновить каталог +
++  toast «Настройки LLM сохранены»).
++
++## 3. Тесты (новые, 28 шт.)
++
++**`test_chat_real.py`** (20):
++- *Loopback gpt_client (6):* реальный HTTP roundtrip; payload несёт
++  system/history/temperature/max_tokens/model; без ключей → `AIUnavailable`
++  **до** выхода в сеть; сервер 500 → `AIUnavailable`, краша нет; ключ в файле
++  не plaintext.
++- *ChatController (4):* два хода end-to-end (история накапливается и видна
++  серверу, busy True→False, очистка); нет провайдера → «⚠ AIUnavailable…»
++  в чат без фабрикации; ядро не импортируется → честный гейт `ctl_llm_missing`;
++  `available_models`/`select_model` roundtrip с флагом `current`.
++- *SettingsPanel (4):* кастомный провайдер виден; сохранение провайдера+ключа
++  (в файле не plaintext, поле очищено, `llm_saved` эмитнут); состояние ключа
++  отражает факт; пустое поле ключа не затирает сохранённый.
++- *ModelSelector/ChatWorkspace (6):* конструктор без демо-стабов; тихая
++  пересборка и подсветка current; выбор пользователя эмитит id;
++  `select_id` без сигнала; `send_requested` несёт `(текст, системный, id, 0.42, 512)`.
++
++**`test_backend_select_real.py`** (8): статусы движков из реального окружения;
++закреплённый espeak **реально синтезирует** WAV; закреплённый недоступный
++coqui → ошибка с именем движка, файла нет; неизвестный id → WARN;
++auto-fallback coqui→espeak; повторный выбор сбрасывает кэш; RVC-скан
++находит реальные `.pth`, пустой каталог — честно пустой.
++
++## 4. Проверки
++
++- Полный прогон: **586 passed** (было 558), 3 файла требуют torch — вне среды.
++- `lint-imports`: контракт `layered_architecture` — **KEPT**.
++- Скриншот `ui_workspace_chat_real.png`: русский UI, реальный диалог в 2 хода
++  против loopback-сервера, селектор «qa-model-1 (Loopback QA)», ключ ✓.
++
++## 5. Осознанные границы (не заглушки)
++
++- Скрытый проброс реальных ключей невозможен офлайн: боевые Groq/OpenRouter/ProxyAPI
++  не дёргались (нет ключей/сети к ним); протокол идентичен loopback-серверу.
++- «Стриминг» шага пайплайна чата — декоративного посимвольного вывода нет:
++  голые провайдеры отдают ответ целиком; UI честно показывает один ответ.
++- `secret_store` на Linux вне тестов требует Windows DPAPI → сохранение ключа
++  даст **явную** `SecretStoreUnavailable` (fail-closed by design ядра).
+diff --git a/ai_studio_core/ai_studio_core/gpt_client.py b/ai_studio_core/ai_studio_core/gpt_client.py
+index da655ba..a32e8c2 100644
+--- a/ai_studio_core/ai_studio_core/gpt_client.py
++++ b/ai_studio_core/ai_studio_core/gpt_client.py
+@@ -676,7 +676,8 @@ def apply_key_from_library(key_id: str) -> dict:
+ 
+ 
+ def _call_api(
+-    messages: list, model: str = None, max_tokens: int = 2048, provider: str = None
++    messages: list, model: str = None, max_tokens: int = 2048,
++    provider: str = None, temperature: float = 0.7,
+ ) -> str:
+     provider = provider or get_provider()
+ 
+@@ -709,7 +710,7 @@ def _call_api(
+             "model": model,
+             "messages": messages,
+             "max_tokens": max_tokens,
+-            "temperature": 0.7,
++            "temperature": float(temperature),
+         }
+     ).encode("utf-8")
+ 
+@@ -906,7 +907,7 @@ def get_chain_diagnostics() -> dict:
+     }
+ 
+ 
+-def _call_with_chain(messages: list, max_tokens: int = 2048) -> str:
++def _call_with_chain(messages: list, max_tokens: int = 2048, temperature: float = 0.7) -> str:
+     """
+     Пробует все провайдеры из цепочки по очереди (primary, затем fallback модель
+     каждого). Сетевая ошибка прерывает попытки ТОЛЬКО для текущего провайдера
+@@ -930,7 +931,10 @@ def _call_with_chain(messages: list, max_tokens: int = 2048) -> str:
+         for model in models_to_try:
+             total_attempts += 1
+             try:
+-                return _call_api(messages, model=model, max_tokens=max_tokens, provider=provider)
++                return _call_api(
++                    messages, model=model, max_tokens=max_tokens,
++                    provider=provider, temperature=temperature,
++                )
+             except GroqNetworkError as e:
+                 network_failures += 1
+                 print(f"[AI] {provider}/{model}: недоступен по сети ({e}), пробую дальше...")
+@@ -984,7 +988,8 @@ _TTS_SYSTEM = (
+ # ── public API ─────────────────────────────────────────────────────────────────
+ 
+ 
+-def chat(prompt: str, history: list = None, system: str = None) -> str:
++def chat(prompt: str, history: list = None, system: str = None,
++         max_tokens: int = 2048, temperature: float = 0.7) -> str:
+     """
+     Free chat. history — list of {"role": "user"/"assistant", "content": "..."}.
+     Пробует все провайдеры из цепочки (см. _call_with_chain).
+@@ -996,7 +1001,7 @@ def chat(prompt: str, history: list = None, system: str = None) -> str:
+         messages.extend(history)
+     messages.append({"role": "user", "content": prompt})
+ 
+-    return _call_with_chain(messages, max_tokens=2048)
++    return _call_with_chain(messages, max_tokens=max_tokens, temperature=temperature)
+ 
+ 
+ def improve_for_tts(text: str) -> str:
+diff --git a/ai_studio_core/ai_studio_core/i18n.py b/ai_studio_core/ai_studio_core/i18n.py
+index 340d0a7..16bf189 100644
+--- a/ai_studio_core/ai_studio_core/i18n.py
++++ b/ai_studio_core/ai_studio_core/i18n.py
+@@ -208,15 +208,26 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "set_choose_dir": "Select directory",
+         "theme_dark": "Dark",
+         "device_auto": "Auto (GPU if available)",
++        "set_llm": "LLM Provider",
++        "set_provider": "Provider:",
++        "set_api_key": "API key:",
++        "set_api_key_ph": "Paste the API key…",
++        "set_save": "Save",
++        "set_key_state_ok": "key configured ✓",
++        "set_key_state_missing": "key not set",
++        "set_key_saved": "LLM settings saved",
++        "model_auto": "Auto (recommended)",
++        "prov_engines": "Local engines",
+         # ── Controllers / messages ──
+         "ctl_engine_loaded": "TTS engine dependencies loaded",
+         "ctl_tts_missing": "No TTS backend available: install Coqui TTS (pip install -e \".[ml]\") or espeak-ng",
++        "ctl_backend_missing": "Selected TTS backend is not available",
+         "ctl_rvc_missing": "RVC backend is not installed in this build (rvc-python + models)",
+         "ctl_gen_cancelled": "Generation cancelled",
+         "ctl_chat_cancelled": "Chat cancelled",
+         "ctl_chat_cleared": "Chat cleared",
+         "ctl_reply_received": "Reply received",
+-        "ctl_llm_missing": "LLM API key is not configured. Set it via Settings → Models (gpt settings) and try again.",
++        "ctl_llm_missing": "No LLM client configured: pick a provider and paste the API key in Settings → LLM Provider.",
+         "ctl_img_missing": "No image backend available: install diffusers/torch or configure an image API key",
+         "ctl_export_done": "Exported:",
+         "ctl_export_fail": "Export failed",
+@@ -391,15 +402,26 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
+         "set_choose_dir": "Выберите каталог",
+         "theme_dark": "Тёмная",
+         "device_auto": "Авто (GPU, если доступен)",
++        "set_llm": "LLM-провайдер",
++        "set_provider": "Провайдер:",
++        "set_api_key": "API-ключ:",
++        "set_api_key_ph": "Вставьте API-ключ…",
++        "set_save": "Сохранить",
++        "set_key_state_ok": "ключ настроен ✓",
++        "set_key_state_missing": "ключ не задан",
++        "set_key_saved": "Настройки LLM сохранены",
++        "model_auto": "Авто (рекомендуется)",
++        "prov_engines": "Локальные движки",
+         # ── Controllers / messages ──
+         "ctl_engine_loaded": "Зависимости TTS-движка загружены",
+         "ctl_tts_missing": "Нет доступного TTS-бэкенда: установите Coqui TTS (pip install -e \".[ml]\") или espeak-ng",
++        "ctl_backend_missing": "Выбранный TTS-бэкенд недоступен",
+         "ctl_rvc_missing": "RVC-бэкенд не установлен в этой сборке (rvc-python + модели)",
+         "ctl_gen_cancelled": "Генерация отменена",
+         "ctl_chat_cancelled": "Чат отменён",
+         "ctl_chat_cleared": "Чат очищен",
+         "ctl_reply_received": "Ответ получен",
+-        "ctl_llm_missing": "API-ключ LLM не настроен. Укажите его в настройках моделей (gpt settings) и повторите.",
++        "ctl_llm_missing": "LLM-клиент не настроен: выберите провайдера и введите API-ключ в Настройки → LLM-провайдер.",
+         "ctl_img_missing": "Нет image-бэкенда: установите diffusers/torch или укажите ключ image API",
+         "ctl_export_done": "Экспортировано:",
+         "ctl_export_fail": "Ошибка экспорта",
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
+index da8ab6d..7585fc9 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/chat_controller.py
+@@ -1,9 +1,11 @@
+-"""Контроллер чата с LLM.
++"""Контроллер чата с LLM — реальная интеграция с ai_studio_core.gpt_client.
+ 
+-Рабочий каркас: история диалога, обращение к gpt_client в фоновом потоке,
+-отсутствие каких-либо сгенерированных-заранее «демо-ответов».
+-Когда API-ключ не настроен — пользователь получает честное уведомление.
+-Полная интеграция (потоковые ответы, выбор провайдера) — отдельным этапом.
++  * история диалога ведётся контроллером и передаётся в API;
++  * system prompt / temperature / max tokens пробрасываются из сайдбара;
++  * вызов идёт в фоновом потоке (UI не блокируется);
++  * AIUnavailable (нет ключа/провайдера, сеть) → честное сообщение пользователю,
++    никаких сфабрикованных ответов;
++  * модель/провайдер берутся из настроек gpt_client (Settings → LLM Provider).
+ """
+ from __future__ import annotations
+ 
+@@ -17,20 +19,65 @@ from .base_controller import BaseController
+ class ChatController(BaseController):
+     message_received = Signal(str)      # assistant content
+     message_added = Signal(str, str)    # (role, content)
+-    streaming_chunk = Signal(str)
+     generation_started = Signal()
+     generation_finished = Signal()
+ 
+     def __init__(self):
+         super().__init__()
+         self._client_ready = False
++        self._history: list[dict] = []
++
++    # ── Публичное API ──
++
++    def history(self) -> list[dict]:
++        return list(self._history)
++
++    def set_history(self, history: list[dict]) -> None:
++        self._history = [dict(h) for h in history if h.get("content")]
++
++    def available_models(self) -> list[dict]:
++        """Модели активного провайдера (из его каталога) для ModelSelector."""
++        try:
++            from ai_studio_core import gpt_client
++            pid = gpt_client.get_provider()
++            info = gpt_client.get_provider_info(pid)
++            configured = bool(gpt_client.get_api_key(pid)) or pid == "local"
++            current = gpt_client.get_model(pid)
++            status = "ready" if configured else "error"
++            out = []
++            for m in info.get("models", []):
++                out.append({
++                    "id": m,
++                    "name": m,
++                    "provider": info.get("label", pid),
++                    "status": status,
++                    "current": m == current,
++                })
++            return out
++        except Exception as e:
++            self.log_message.emit("WARN", f"model list unavailable: {e}")
++            return []
++
++    def select_model(self, model_id: str) -> None:
++        """Сохраняет выбранную модель активного провайдера в настройки."""
++        try:
++            from ai_studio_core import gpt_client
++            gpt_client.set_model(model_id)
++            self.status_message.emit(f"Model: {model_id}")
++        except Exception as e:
++            self.log_message.emit("WARN", f"set_model failed: {e}")
++
++    # ── Внутреннее ──
+ 
+     def _ensure_client(self) -> bool:
+         if self._client_ready:
+             return True
+         try:
+-            from ai_studio_core.gpt_client import chat as _chat_fn
++            from ai_studio_core.gpt_client import (
++                AIUnavailable, chat as _chat_fn,
++            )
+             self._chat_fn = _chat_fn
++            self._ai_unavailable = AIUnavailable
+             self._client_ready = True
+             return True
+         except Exception as e:
+@@ -38,32 +85,55 @@ class ChatController(BaseController):
+             return False
+ 
+     @Slot(str)
+-    def on_send(self, user_message: str, system_prompt: str = "", model: str = "", temperature: float = 0.7) -> None:
+-        # User-пузырь уже отрисован workspace'ом, повторно не добавляем,
+-        # иначе в UI появится дубликат сообщения.
++    def on_send(self, user_message: str, system_prompt: str = "",
++                model: str = "", temperature: float = 0.7,
++                max_tokens: int = 2048) -> None:
++        # User-пузырь уже отрисован workspace'ом, повторно не добавляем.
+         if not self._ensure_client():
+             self.message_added.emit("assistant", tr("ctl_llm_missing"))
+             self.status_message.emit(tr("ctl_llm_missing"))
+             return
++
++        if model:
++            self.select_model(model)
++
++        history = list(self._history)
+         self.generation_started.emit()
+ 
+         def _call(progress_callback=None, cancel_check=None) -> str:
+             if cancel_check and cancel_check():
+                 return ""
+-            return self._chat_fn(user_message, system=system_prompt or None)
++            return self._chat_fn(
++                user_message,
++                history=history,
++                system=system_prompt or None,
++                max_tokens=max_tokens,
++                temperature=temperature,
++            )
+ 
+         worker = self._run_in_background(_call)
+         worker.result.connect(self._on_reply)
++        worker.error.connect(self._on_call_error)
++        self._pending_user = user_message
+ 
+     @Slot(object)
+     def _on_reply(self, reply) -> None:
+         if not reply:
+             return
++        self._history.append({"role": "user", "content": self._pending_user})
++        self._history.append({"role": "assistant", "content": reply})
+         self.message_received.emit(reply)
+         self.message_added.emit("assistant", reply)
+         self.generation_finished.emit()
+         self.status_message.emit(tr("ctl_reply_received"))
+ 
++    @Slot(str)
++    def _on_call_error(self, message: str) -> None:
++        # AIUnavailable и прочие сбои — честно в чат и статус, без краша
++        self.message_added.emit("assistant", f"⚠ {message}")
++        self.status_message.emit(message[:200])
++        self.generation_finished.emit()
++
+     @Slot()
+     def on_stop(self) -> None:
+         self.cancel_current()
+@@ -71,4 +141,5 @@ class ChatController(BaseController):
+ 
+     @Slot()
+     def on_clear(self) -> None:
++        self._history.clear()
+         self.status_message.emit(tr("ctl_chat_cleared"))
+diff --git a/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py b/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
+index 7152129..fe7084e 100644
+--- a/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
++++ b/ai_studio_core/ai_studio_core/ui/controllers/tts_controller.py
+@@ -81,6 +81,7 @@ class TTSController(BaseController):
+         self._normalize_fn = None
+         self._chunk_fn = None
+         self._backend: str | None = None
++        self._preferred_backend = "auto"  # auto | coqui | espeak
+         self._queue = None          # QueueController (attach_queue)
+         self._task_id: str | None = None
+         self._last_output: str | None = None
+@@ -90,9 +91,57 @@ class TTSController(BaseController):
+     def backend(self) -> str | None:
+         return self._backend
+ 
++    def preferred_backend(self) -> str:
++        return self._preferred_backend
++
+     def last_output(self) -> str | None:
+         return self._last_output
+ 
++    def available_models(self) -> list[dict]:
++        """Реальные TTS-движки для селектора: статус отражает фактическую
++        доступность в текущем окружении (без обещаний несуществующего)."""
++        from ai_studio_core import espeak_tts
++        pref = self._preferred_backend
++        return [
++            {"id": "auto", "name": tr("model_auto"), "provider": "",
++             "status": "ready", "current": pref == "auto"},
++            {"id": "coqui", "name": "Coqui XTTS v2", "provider": tr("prov_engines"),
++             "status": "ready" if _coqui_available() else "download",
++             "current": pref == "coqui"},
++            {"id": "espeak", "name": "espeak-ng", "provider": tr("prov_engines"),
++             "status": "ready" if espeak_tts.available() else "error",
++             "current": pref == "espeak"},
++        ]
++
++    @Slot(str)
++    def select_backend(self, backend_id: str) -> None:
++        """Фиксирует выбранный движок; 'auto' — автоопределение (coqui→espeak)."""
++        bid = (backend_id or "").strip() or "auto"
++        if bid not in ("auto", "coqui", "espeak"):
++            self.log_message.emit("WARN", f"unknown TTS backend: {backend_id}")
++            return
++        self._preferred_backend = bid
++        self._backend = None  # пересчитается при следующей генерации
++        self.status_message.emit(f"TTS backend: {bid}")
++
++    def rvc_models(self) -> list[dict]:
++        """Реальный скан каталога моделей на .pth-файлы RVC.
++
++        Ничего не найдено — честно пустой список (RVC-гейт в on_generate
++        всё равно не пропустит конвертацию без бэкенда)."""
++        import glob
++        out: list[dict] = []
++        try:
++            from ai_studio_core.paths import MODEL_DIR
++            if os.path.isdir(MODEL_DIR):
++                for p in sorted(glob.glob(os.path.join(MODEL_DIR, "**", "*.pth"),
++                                          recursive=True)):
++                    out.append({"id": p, "name": os.path.basename(p),
++                                "provider": "RVC", "status": "ready"})
++        except Exception as e:
++            self.log_message.emit("WARN", f"RVC model scan failed: {e}")
++        return out
++
+     def attach_queue(self, queue_controller) -> None:
+         """Подключает очередь задач: генерация регистрирует в ней реальную задачу."""
+         self._queue = queue_controller
+@@ -129,12 +178,22 @@ class TTSController(BaseController):
+ 
+     def _ensure_backend(self) -> bool:
+         if self._backend is None:
+-            self._backend = _detect_backend()
++            self._backend = self._resolve_backend()
+             if self._backend:
+                 self.backend_changed.emit(self._backend)
+                 self.log_message.emit("INFO", f"TTS backend: {self._backend}")
+         return self._backend is not None
+ 
++    def _resolve_backend(self) -> str | None:
++        """Уважает выбор пользователя: закреплённый движок проверяется честно,
++        авто — coqui→espeak по факту доступности."""
++        if self._preferred_backend == "coqui":
++            return "coqui" if _coqui_available() else None
++        if self._preferred_backend == "espeak":
++            from ai_studio_core import espeak_tts
++            return "espeak" if espeak_tts.available() else None
++        return _detect_backend()
++
+     # ── Генерация ──
+ 
+     @Slot(str, dict)
+@@ -144,8 +203,13 @@ class TTSController(BaseController):
+ 
+         if not engine_ok or not backend_ok:
+             self.pipeline_step_changed.emit(0, "error")
+-            self.error_occurred.emit(tr("ctl_tts_missing"))
+-            self.status_message.emit(tr("ctl_tts_missing"))
++            if backend_ok is False and self._preferred_backend not in ("", "auto"):
++                # Пользователь явно выбрал движок — говорим именно про него
++                msg = f'{tr("ctl_backend_missing")}: {self._preferred_backend}'
++            else:
++                msg = tr("ctl_tts_missing")
++            self.error_occurred.emit(msg)
++            self.status_message.emit(msg)
+             return
+ 
+         if params.get("rvc_enabled"):
+diff --git a/ai_studio_core/ai_studio_core/ui/main_window.py b/ai_studio_core/ai_studio_core/ui/main_window.py
+index 6ba7282..5b24662 100644
+--- a/ai_studio_core/ai_studio_core/ui/main_window.py
++++ b/ai_studio_core/ai_studio_core/ui/main_window.py
+@@ -279,6 +279,16 @@ class MainWindow(QMainWindow):
+         self._chat_ctrl.log_message.connect(self._log_widget.append)
+         self._chat_ctrl.error_occurred.connect(lambda msg: self._toast(msg, "error"))
+ 
++        # Селекторы моделей наполняются реальными данными контроллеров
++        chat_sel = self._chat_workspace.model_selector()
++        chat_sel.model_changed.connect(self._chat_ctrl.select_model)
++        self._refresh_chat_models()
++        tts_sel = self._tts_workspace.model_selector()
++        tts_sel.model_changed.connect(self._tts_ctrl.select_backend)
++        tts_sel.set_models(self._tts_ctrl.available_models())
++        self._tts_workspace.rvc_selector().set_models(self._tts_ctrl.rvc_models())
++        self._settings_widget.llm_saved.connect(self._on_llm_saved)
++
+         # History: выбор элемента → Inspector
+         self._history_widget.item_selected.connect(self._on_history_selected)
+ 
+@@ -294,6 +304,21 @@ class MainWindow(QMainWindow):
+         self._queue_ctrl.queue_changed.connect(self._queue_widget.set_tasks)
+         self._queue_widget.set_tasks(self._queue_ctrl.tasks())
+ 
++    def _refresh_chat_models(self) -> None:
++        """Каталог моделей активного провайдера → селектор чата."""
++        try:
++            models = self._chat_ctrl.available_models()
++        except Exception as e:
++            self._log_widget.append("WARN", f"chat model list failed: {e}")
++            models = []
++        self._chat_workspace.set_models(models)
++
++    def _on_llm_saved(self, pid: str) -> None:
++        """Settings → LLM Provider: провайдер/ключ сохранены в gpt_settings."""
++        self._refresh_chat_models()
++        self._toast(tr("set_key_saved"), "success")
++        self._log_widget.append("INFO", f"LLM provider saved: {pid}")
++
+     def _on_tts_step(self, idx: int, state: str) -> None:
+         strip = self._tts_workspace.pipeline()
+         if strip is not None:
+diff --git a/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py b/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py
+index 381e314..c058766 100644
+--- a/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py
++++ b/ai_studio_core/ai_studio_core/ui/panels/settings_panel.py
+@@ -31,6 +31,7 @@ class SettingsPanel(QWidget):
+     settings_changed = Signal(dict)     # полный снапшот настроек
+     language_changed = Signal(str)      # код языка ("en"/"ru")
+     paths_changed = Signal(str, str)    # (kind: "models"/"output", path)
++    llm_saved = Signal(str)             # id сохранённого провайдера
+ 
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
+@@ -105,6 +106,39 @@ class SettingsPanel(QWidget):
+         self._paths_group.set_content_layout(paths_form)
+         layout.addWidget(self._paths_group)
+ 
++        # ── LLM Provider (реальные ключи/провайдер через gpt_client) ──
++        self._llm_group = CollapsibleGroup("")
++        llm_form = QFormLayout()
++
++        from PySide6.QtWidgets import QLineEdit
++        self._provider = QComboBox()
++        self._provider_lbl = QLabel()
++        llm_form.addRow(self._provider_lbl, self._provider)
++
++        self._api_key = QLineEdit()
++        self._api_key.setEchoMode(QLineEdit.EchoMode.Password)
++        self._api_key.setClearButtonEnabled(True)
++        self._api_key_lbl = QLabel()
++        llm_form.addRow(self._api_key_lbl, self._api_key)
++
++        self._key_state = QLabel()
++        self._key_state.setStyleSheet(
++            f"color: {TOKENS.colors.text_secondary}; "
++            f"font-size: {TOKENS.font_size.caption}px;"
++        )
++        llm_form.addRow(self._key_state)
++
++        self._btn_save_llm = QPushButton()
++        self._btn_save_llm.clicked.connect(self._save_llm)
++        llm_form.addRow(self._btn_save_llm)
++
++        # Все виджеты группы созданы — можно безопасно наполнять комбобокс
++        self._provider.currentIndexChanged.connect(lambda _i: self._refresh_key_state())
++        self._rebuild_providers()
++
++        self._llm_group.set_content_layout(llm_form)
++        layout.addWidget(self._llm_group)
++
+         # ── About ──
+         self._about_group = CollapsibleGroup("")
+         about_form = QVBoxLayout()
+@@ -171,8 +205,78 @@ class SettingsPanel(QWidget):
+         self._paths_group.set_title(tr("set_paths"))
+         self._models_lbl.setText(tr("set_models_dir"))
+         self._output_lbl.setText(tr("set_output_dir"))
++        self._llm_group.set_title(tr("set_llm"))
++        self._provider_lbl.setText(tr("set_provider"))
++        self._api_key_lbl.setText(tr("set_api_key"))
++        self._api_key.setPlaceholderText(tr("set_api_key_ph"))
++        self._btn_save_llm.setText(tr("set_save"))
++        # Подписи провайдеров зависят от языка — перечитываем из gpt_client
++        self._rebuild_providers()
+         self._about_group.set_title(tr("set_about"))
+ 
++    # ── LLM provider (real gpt_client persistence) ──
++
++    def _rebuild_providers(self) -> None:
++        """Наполняет комбобокс провайдеров из gpt_client (с подписями i18n)."""
++        try:
++            from ai_studio_core import gpt_client
++            gpt_client.refresh_i18n_labels()
++            providers = []
++            for pid, info in gpt_client.PROVIDERS.items():
++                providers.append((pid, info.get("label", pid)))
++            for entry in gpt_client.list_custom_providers():
++                if entry.get("id") not in gpt_client.PROVIDERS:
++                    providers.append((entry["id"], entry.get("label", entry["id"])))
++            current = gpt_client.get_provider()
++        except Exception:
++            providers, current = [], ""
++        self._provider.blockSignals(True)
++        self._provider.clear()
++        for pid, label in providers:
++            self._provider.addItem(label, userData=pid)
++        if current:
++            idx = self._provider.findData(current)
++            if idx >= 0:
++                self._provider.setCurrentIndex(idx)
++        self._provider.blockSignals(False)
++        self._refresh_key_state()
++
++    def selected_provider(self) -> str:
++        return self._provider.currentData() or ""
++
++    def _refresh_key_state(self) -> None:
++        pid = self.selected_provider()
++        configured = False
++        if pid:
++            try:
++                from ai_studio_core import gpt_client
++                configured = bool(gpt_client.get_api_key(pid)) or pid == "local"
++            except Exception:
++                configured = False
++        key = "set_key_state_ok" if configured else "set_key_state_missing"
++        self._key_state.setText(tr(key))
++        color = TOKENS.colors.accent_success if configured else TOKENS.colors.accent_warning
++        self._key_state.setStyleSheet(
++            f"color: {color}; font-size: {TOKENS.font_size.caption}px;"
++        )
++
++    def _save_llm(self) -> None:
++        pid = self.selected_provider()
++        if not pid:
++            return
++        try:
++            from ai_studio_core import gpt_client
++            gpt_client.set_provider(pid)
++            key = self._api_key.text().strip()
++            if key:
++                gpt_client.set_api_key(key, pid)
++                self._api_key.clear()
++        except Exception as e:
++            self._key_state.setText(f"⚠ {type(e).__name__}: {e}")
++            return
++        self._refresh_key_state()
++        self.llm_saved.emit(pid)
++
+     # ── Internals ──
+ 
+     def _on_lang_index(self, _index: int) -> None:
+diff --git a/ai_studio_core/ai_studio_core/ui/widgets/model_selector.py b/ai_studio_core/ai_studio_core/ui/widgets/model_selector.py
+index c6f767c..deb2f96 100644
+--- a/ai_studio_core/ai_studio_core/ui/widgets/model_selector.py
++++ b/ai_studio_core/ai_studio_core/ui/widgets/model_selector.py
+@@ -1,12 +1,19 @@
+-"""Универсальный селектор модели/провайдера."""
++"""Универсальный селектор модели/провайдера.
++
++Без демо-данных: виджет стартует пустым и наполняется только через
++set_models() реальными данными контроллера — каталогом моделей активного
++провайдера, списком доступных TTS-бэкендов или файлами моделей на диске.
++"""
+ from __future__ import annotations
+ 
+-from PySide6.QtCore import Qt, Signal
++from PySide6.QtCore import Signal
+ from PySide6.QtWidgets import QComboBox, QWidget
+ 
++_STATUS_ICONS = {"ready": "✅", "download": "📥", "error": "❌", "loading": "⏳"}
++
+ 
+ class ModelSelector(QComboBox):
+-    model_changed = Signal(str)
++    model_changed = Signal(str)  # id выбранной модели (userData)
+ 
+     def __init__(
+         self,
+@@ -20,32 +27,61 @@ class ModelSelector(QComboBox):
+         self.setMinimumWidth(220)
+         self.setEditable(True)
+         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+-
+-        if category == "tts":
+-            self.addItems(["XTTS v2.0.2", "XTTS v2.0.1", "StyleTTS2", "Bark-small"])
+-        elif category == "llm":
+-            self.addItems(["GPT-4o", "GPT-4o-mini", "Claude 3.5 Sonnet", "Groq Llama 3.1 70B", "Local: Llama 3.1 8B"])
+-        elif category == "rvc":
+-            self.addItems(["(none)", "Male v2", "Female v1", "Custom…"])
+-        else:
+-            self.addItem(placeholder)
+-
++        # Список пуст до вызова set_models() — никаких заглушек.
+         self.currentTextChanged.connect(self._on_changed)
+ 
+     def set_models(self, models: list[dict]) -> None:
+-        self.clear()
+-        current_provider = None
+-        for m in models:
+-            provider = m.get("provider", "")
+-            if provider != current_provider:
+-                if current_provider is not None:
+-                    self.insertSeparator(self.count())
+-                current_provider = provider
+-            status_icon = {"ready": "✅", "download": "📥", "error": "❌", "loading": "⏳"}.get(m.get("status", ""), "")
+-            display = f"{status_icon} {m['name']}  ({provider})" if status_icon else m["name"]
+-            self.addItem(display, userData=m.get("id"))
+-
+-    def _on_changed(self, text: str) -> None:
++        """Пересобирает список БЕЗ эмиссии model_changed.
++
++        models: [{"id": str, "name": str, "provider": str,
++                  "status": ready|download|error|loading, "current": bool}]
++        Запись с current=True программно выбирается (тоже без сигнала).
++        """
++        self.blockSignals(True)
++        try:
++            self.clear()
++            current_provider = None
++            current_idx = -1
++            for m in models:
++                provider = m.get("provider", "")
++                if provider != current_provider:
++                    if current_provider is not None:
++                        self.insertSeparator(self.count())
++                    current_provider = provider
++                icon = _STATUS_ICONS.get(m.get("status", ""), "")
++                name = m.get("name", m.get("id", ""))
++                if icon and provider:
++                    display = f"{icon} {name}  ({provider})"
++                elif icon:
++                    display = f"{icon} {name}"
++                else:
++                    display = name
++                self.addItem(display, userData=m.get("id"))
++                if m.get("current"):
++                    current_idx = self.count() - 1
++            if current_idx >= 0:
++                self.setCurrentIndex(current_idx)
++            elif self.count():
++                self.setCurrentIndex(0)
++        finally:
++            self.blockSignals(False)
++
++    def current_model_id(self) -> str:
++        """id выбранной записи (userData), '' если список пуст/id не задан."""
++        data = self.currentData()
++        return str(data) if data else ""
++
++    def select_id(self, model_id: str) -> bool:
++        """Программно выбирает запись по id без эмиссии model_changed."""
++        idx = self.findData(model_id)
++        if idx < 0:
++            return False
++        was = self.blockSignals(True)
++        self.setCurrentIndex(idx)
++        self.blockSignals(was)
++        return True
++
++    def _on_changed(self, _text: str) -> None:
+         model_id = self.currentData()
+         if model_id:
+             self.model_changed.emit(str(model_id))
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py
+index 944636b..9d434c6 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/chat_workspace.py
+@@ -52,7 +52,8 @@ class ChatBubble(QFrame):
+ 
+ 
+ class ChatWorkspace(BaseWorkspace):
+-    send_requested = Signal(str, str, str, float)  # (message, system, model, temperature)
++    # (message, system, model_id, temperature, max_tokens)
++    send_requested = Signal(str, str, str, float, int)
+     stop_requested = Signal()
+     clear_requested = Signal()
+ 
+@@ -248,11 +249,16 @@ class ChatWorkspace(BaseWorkspace):
+         self._chat_layout.addWidget(ChatBubble("user", text))
+         self._input.clear()
+         self._update_context_labels()
++        try:
++            max_tokens = int(self._max_tokens.currentText())
++        except ValueError:
++            max_tokens = 2048
+         self.send_requested.emit(
+             text,
+             self._system_prompt.toPlainText(),
+-            self._model_selector.currentText(),
++            self._model_selector.current_model_id(),
+             self._temp_slider.value() / 100,
++            max_tokens,
+         )
+ 
+     def _on_clear(self) -> None:
+@@ -272,6 +278,13 @@ class ChatWorkspace(BaseWorkspace):
+         sb = self._scroll.verticalScrollBar()
+         sb.setValue(sb.maximum())
+ 
++    def set_models(self, models: list[dict]) -> None:
++        """Наполняет селектор реальным каталогом активного провайдера."""
++        self._model_selector.set_models(models)
++
++    def model_selector(self) -> ModelSelector:
++        return self._model_selector
++
+     def set_busy(self, busy: bool) -> None:
+         self._btn_send.setEnabled(not busy)
+         self._input.setEnabled(not busy)
+diff --git a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+index 4e59dee..37b7ded 100644
+--- a/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
++++ b/ai_studio_core/ai_studio_core/ui/workspaces/tts_workspace.py
+@@ -254,6 +254,14 @@ class TTSWorkspace(BaseWorkspace):
+     def set_text(self, text: str) -> None:
+         self._text_input.setPlainText(text)
+ 
++    def model_selector(self) -> ModelSelector:
++        """Селектор TTS-движка в тулбаре (наполняется реальными бэкендами)."""
++        return self._model_selector
++
++    def rvc_selector(self) -> ModelSelector:
++        """Селектор RVC-модели (наполняется реальным сканом models/ на .pth)."""
++        return self._rvc_model
++
+     def waveform_widget(self) -> WaveformView:
+         return self._waveform
+ 
+@@ -295,7 +303,7 @@ class TTSWorkspace(BaseWorkspace):
+             "top_p": self._slider_top_p.value() / 100,
+             "repetition_penalty": self._slider_rep.value() / 100,
+             "rvc_enabled": self._rvc_enable.isChecked(),
+-            "rvc_model": self._rvc_model.currentText(),
++            "rvc_model": self._rvc_model.current_model_id(),
+             "rvc_index_rate": self._slider_index.value() / 100,
+             "rvc_pitch": self._slider_pitch.value(),
+             "output_format": self._out_format.currentText().lower(),
+diff --git a/ai_studio_core/test/test_backend_select_real.py b/ai_studio_core/test/test_backend_select_real.py
+new file mode 100644
+index 0000000..f2b74c0
+--- /dev/null
++++ b/ai_studio_core/test/test_backend_select_real.py
+@@ -0,0 +1,155 @@
++# -*- coding: utf-8 -*-
++"""Реальный выбор TTS-бэкенда: селектор отражает окружение, выбор честно
++применяется, недоступный движок → явная ошибка вместо молчаливой подмены.
++"""
++from __future__ import annotations
++
++import os
++import time
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++pytest.importorskip("PySide6", reason="контроллер — QObject")
++
++from PySide6.QtWidgets import QApplication
++
++from ai_studio_core import espeak_tts, paths
++
++pytestmark = pytest.mark.skipif(
++    not espeak_tts.available(), reason="espeak не установлен"
++)
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _wait(app, cond, timeout=30.0):
++    t0 = time.time()
++    while not cond() and time.time() - t0 < timeout:
++        app.processEvents()
++        time.sleep(0.02)
++    return cond()
++
++
++@pytest.fixture()
++def sandboxed_dirs(tmp_path, monkeypatch):
++    """outputs/history в tmp — репозиторий не мусорим."""
++    out_dir = tmp_path / "outputs"
++    hist_path = tmp_path / "history.json"
++    monkeypatch.setattr(paths, "OUTPUT_DIR", str(out_dir))
++    import ai_studio_core.output_naming as on
++    import ai_studio_core.history_store as hs
++    monkeypatch.setattr(on, "OUTPUT_DIR", str(out_dir))
++    monkeypatch.setattr(hs, "HISTORY_PATH", str(hist_path))
++    return out_dir
++
++
++class TestAvailableModels:
++    def test_reflects_real_environment(self, app):
++        from ai_studio_core.ui.controllers.tts_controller import (
++            TTSController, _coqui_available,
++        )
++        ctrl = TTSController()
++        models = ctrl.available_models()
++        assert [m["id"] for m in models] == ["auto", "coqui", "espeak"]
++        by_id = {m["id"]: m for m in models}
++        assert by_id["auto"]["current"] is True
++        assert by_id["espeak"]["status"] == (
++            "ready" if espeak_tts.available() else "error"
++        )
++        assert by_id["coqui"]["status"] == (
++            "ready" if _coqui_available() else "download"
++        )
++
++    def test_current_follows_user_choice(self, app):
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        ctrl = TTSController()
++        ctrl.select_backend("espeak")
++        models = {m["id"]: m for m in ctrl.available_models()}
++        assert models["espeak"]["current"] is True
++        assert models["auto"]["current"] is False
++
++
++class TestBackendPinning:
++    def test_pinned_espeak_used_for_real_generation(self, app, sandboxed_dirs):
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        ctrl = TTSController()
++        ctrl.select_backend("espeak")
++        done = {}
++        ctrl.generation_complete.connect(lambda p: done.update(path=p))
++        ctrl.error_occurred.connect(lambda m: done.update(err=m))
++        ctrl.on_generate("Pinned backend synthesis check.",
++                         {"language": "en", "speed": 1.0})
++        assert _wait(app, lambda: "path" in done or "err" in done, 30)
++        assert "path" in done, f"генерация упала: {done.get('err')}"
++        assert ctrl.backend() == "espeak"
++        assert os.path.exists(done["path"])
++        assert os.path.getsize(done["path"]) > 0
++
++    def test_pinned_unavailable_backend_honest_error(self, app, monkeypatch):
++        """coqui выбран, но недоступен → явная ошибка, файла-пустышки нет."""
++        import ai_studio_core.ui.controllers.tts_controller as mod
++        monkeypatch.setattr(mod, "_coqui_available", lambda: False)
++        ctrl = mod.TTSController()
++        errors = []
++        ctrl.error_occurred.connect(errors.append)
++        ctrl.select_backend("coqui")
++        ctrl.on_generate("Hello", {"language": "en"})
++        assert errors, "ожидали честную ошибку о недоступном движке"
++        assert "coqui" in errors[-1]
++        assert ctrl.last_output() is None
++
++    def test_unknown_backend_rejected_with_warn(self, app):
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        ctrl = TTSController()
++        logs = []
++        ctrl.log_message.connect(lambda lvl, msg: logs.append((lvl, msg)))
++        ctrl.select_backend("bogus-engine")
++        assert ctrl.preferred_backend() == "auto"
++        assert any(lvl == "WARN" for lvl, _ in logs)
++
++    def test_auto_falls_back_to_espeak_without_torch(self, app, monkeypatch):
++        """auto: coqui недоступен → espeak (реальный fallback, не подделка)."""
++        import ai_studio_core.ui.controllers.tts_controller as mod
++        monkeypatch.setattr(mod, "_coqui_available", lambda: False)
++        ctrl = mod.TTSController()
++        assert ctrl._ensure_backend()
++        assert ctrl.backend() == "espeak"
++
++    def test_reselect_recomputes_backend(self, app):
++        """Смена выбора сбрасывает закэшированный бэкенд."""
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        ctrl = TTSController()
++        assert ctrl._ensure_backend()
++        first = ctrl.backend()
++        ctrl.select_backend("auto")
++        assert ctrl._backend is None  # пересчёт при следующей генерации
++        assert ctrl._ensure_backend()
++        assert ctrl.backend() == first  # в этом окружении снова espeak
++
++
++class TestRvcModelScan:
++    def test_scan_finds_real_pth_files(self, app, tmp_path, monkeypatch):
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        mdir = tmp_path / "models"
++        (mdir / "rvc").mkdir(parents=True)
++        (mdir / "rvc" / "singer_v1.pth").write_bytes(b"fake-weights")
++        (mdir / "notes.txt").write_text("not a model")
++        monkeypatch.setattr(paths, "MODEL_DIR", str(mdir))
++
++        ctrl = TTSController()
++        models = ctrl.rvc_models()
++        assert [m["name"] for m in models] == ["singer_v1.pth"]
++        assert models[0]["id"].endswith("singer_v1.pth")
++        assert models[0]["status"] == "ready"
++
++    def test_scan_empty_dir_is_honestly_empty(self, app, tmp_path, monkeypatch):
++        from ai_studio_core.ui.controllers.tts_controller import TTSController
++        monkeypatch.setattr(paths, "MODEL_DIR", str(tmp_path))
++        ctrl = TTSController()
++        assert ctrl.rvc_models() == []
+diff --git a/ai_studio_core/test/test_chat_real.py b/ai_studio_core/test/test_chat_real.py
+new file mode 100644
+index 0000000..9402aa0
+--- /dev/null
++++ b/ai_studio_core/test/test_chat_real.py
+@@ -0,0 +1,393 @@
++# -*- coding: utf-8 -*-
++"""Тесты реального чата без каких-либо заглушек.
++
++Поднимаем настоящий OpenAI-совместимый HTTP-сервер на 127.0.0.1 (loopback —
++единственный случай, когда gpt_client разрешает http://) и проверяем всю цепочку:
++
++  gpt_client.chat  →  реальный HTTP-запрос  →  реальный ответ
++  ChatController   →  worker-поток  →  message_received / история
++  SettingsPanel    →  реальная персистентность провайдера/ключа
++  ChatWorkspace    →  честные id модели/max_tokens в send_requested
++  отказные ветки   →  честный AIUnavailable, Никакой фабрикации ответов
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import pytest
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++import ai_studio_core.gpt_client as gpt_client
++from ai_studio_core.gpt_client import AIUnavailable
++from ai_studio_core.i18n import t as tr
++
++pytest.importorskip("PySide6", reason="контроллер и панели — Qt-объекты")
++
++from PySide6.QtWidgets import QApplication
++
++
++# ── Реальный loopback LLM-сервер ───────────────────────────────────────────────
++
++class _ChatHandler(BaseHTTPRequestHandler):
++    """OpenAI-совместимый /v1/chat/completions с записью всех payload'ов."""
++
++    def do_POST(self):
++        length = int(self.headers.get("Content-Length", 0))
++        payload = json.loads(self.rfile.read(length).decode("utf-8"))
++        self.server.recorded.append(payload)
++
++        if self.server.force_status != 200:
++            body = json.dumps({"error": {"message": "boom from test server"}}).encode()
++            self.send_response(self.server.force_status)
++        else:
++            users = [m for m in payload["messages"] if m["role"] == "user"]
++            reply = "REAL-ECHO: " + (users[-1]["content"] if users else "?")
++            body = json.dumps({
++                "id": "chatcmpl-test",
++                "object": "chat.completion",
++                "choices": [{
++                    "index": 0,
++                    "message": {"role": "assistant", "content": reply},
++                    "finish_reason": "stop",
++                }],
++                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
++            }).encode()
++            self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *args):  # noqa: D401 - тишина в тестах
++        pass
++
++
++@pytest.fixture()
++def llm_server():
++    server = HTTPServer(("127.0.0.1", 0), _ChatHandler)
++    server.recorded = []
++    server.force_status = 200
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield server
++    finally:
++        server.shutdown()
++        thread.join(timeout=5)
++        server.server_close()
++
++
++@pytest.fixture()
++def gpt_env(tmp_path, monkeypatch, llm_server):
++    """Изолированные gpt_settings на tmp + кастомный провайдер на loopback."""
++    settings_file = tmp_path / "gpt_settings.json"
++    monkeypatch.setattr(gpt_client, "_SETTINGS_PATH", str(settings_file))
++    monkeypatch.setenv("XTTS_TEST_SECRET_STORE", "1")
++    port = llm_server.server_address[1]
++    url = f"http://127.0.0.1:{port}/v1/chat/completions"
++    gpt_client.add_custom_provider(
++        "testlocal", "TestLocal", url, ["m-alpha", "m-beta"], "m-alpha"
++    )
++    return {"url": url, "file": settings_file, "server": llm_server}
++
++
++@pytest.fixture()
++def gpt_configured(gpt_env):
++    """Провайдер выбран и ключ сохранён — цепочка провайдеров непустая."""
++    gpt_client.set_provider("testlocal")
++    gpt_client.set_api_key("test-secret-key", "testlocal")
++    return gpt_env
++
++
++@pytest.fixture(scope="module")
++def app():
++    application = QApplication.instance() or QApplication([])
++    yield application
++
++
++def _wait(app, cond, timeout=30.0):
++    t0 = time.time()
++    while not cond() and time.time() - t0 < timeout:
++        app.processEvents()
++        time.sleep(0.02)
++    return cond()
++
++
++# ── gpt_client против реального loopback-сервера ──────────────────────────────
++
++class TestGptClientLoopback:
++    def test_chat_roundtrip_parses_real_response(self, gpt_configured):
++        reply = gpt_client.chat("ping")
++        assert reply == "REAL-ECHO: ping"
++
++    def test_payload_carries_system_history_temperature_maxtokens(self, gpt_configured):
++        gpt_client.chat(
++            "hello",
++            history=[
++                {"role": "user", "content": "prev-q"},
++                {"role": "assistant", "content": "prev-a"},
++            ],
++            system="SYS-MARKER",
++            temperature=0.42,
++            max_tokens=77,
++        )
++        server = gpt_configured["server"]
++        assert len(server.recorded) == 1
++        payload = server.recorded[0]
++        assert payload["temperature"] == 0.42
++        assert payload["max_tokens"] == 77
++        roles = [m["role"] for m in payload["messages"]]
++        assert roles == ["system", "user", "assistant", "user"]
++        assert payload["messages"][0]["content"] == "SYS-MARKER"
++        assert payload["messages"][-1]["content"] == "hello"
++
++    def test_selected_model_goes_to_payload(self, gpt_configured):
++        gpt_client.set_model("m-beta", "testlocal")
++        gpt_client.chat("which model?")
++        payload = gpt_configured["server"].recorded[-1]
++        assert payload["model"] == "m-beta"
++
++    def test_no_key_anywhere_raises_ai_unavailable(self, gpt_env):
++        # Провайдер зарегистрирован, но ни у одного провайдера нет ключа
++        with pytest.raises(AIUnavailable, match="провайдер"):
++            gpt_client.chat("ping")
++        assert gpt_env["server"].recorded == []  # до сети даже не дошли
++
++    def test_server_500_raises_ai_unavailable_not_crash(self, gpt_configured):
++        gpt_configured["server"].force_status = 500
++        with pytest.raises(AIUnavailable, match="недоступн"):
++            gpt_client.chat("ping")
++
++    def test_key_stored_protected_roundtrip(self, gpt_configured):
++        raw = gpt_configured["file"].read_text(encoding="utf-8")
++        assert "test-secret-key" not in raw
++        assert gpt_client.get_api_key("testlocal") == "test-secret-key"
++
++
++# ── ChatController end-to-end через реальный сервер ───────────────────────────
++
++class TestChatControllerReal:
++    def test_two_turns_history_accumulates(self, app, gpt_configured):
++        from ai_studio_core.ui.controllers.chat_controller import ChatController
++
++        ctrl = ChatController()
++        replies, added, busy = [], [], []
++        ctrl.message_received.connect(replies.append)
++        ctrl.message_added.connect(lambda role, content: added.append((role, content)))
++        ctrl.busy_changed.connect(busy.append)
++
++        # Ход 1: реальные параметры проброшены сквозь всю цепочку
++        ctrl.on_send("Hello", system_prompt="SYS", model="m-beta",
++                     temperature=0.33, max_tokens=123)
++        assert _wait(app, lambda: bool(replies), 30), "нет ответа от сервера"
++        assert replies[0] == "REAL-ECHO: Hello"
++
++        payload = gpt_configured["server"].recorded[0]
++        assert payload["model"] == "m-beta"
++        assert payload["temperature"] == 0.33
++        assert payload["max_tokens"] == 123
++        assert payload["messages"][0] == {"role": "system", "content": "SYS"}
++
++        assert busy[0] is True and busy[-1] is False  # сняли флаг занятости
++        assert ("assistant", "REAL-ECHO: Hello") in added
++        history = ctrl.history()
++        assert [h["role"] for h in history] == ["user", "assistant"]
++
++        # Ход 2: сервер должен увидеть накопленную историю
++        ctrl.on_send("Second")
++        assert _wait(app, lambda: len(replies) >= 2, 30)
++        assert replies[1] == "REAL-ECHO: Second"
++        payload2 = gpt_configured["server"].recorded[-1]
++        contents = [(m["role"], m["content"]) for m in payload2["messages"]]
++        assert ("user", "Hello") in contents
++        assert ("assistant", "REAL-ECHO: Hello") in contents
++        assert contents[-1] == ("user", "Second")
++        assert len(ctrl.history()) == 4
++
++        # Очистка честная: история пустеет
++        ctrl.on_clear()
++        assert ctrl.history() == []
++
++    def test_no_provider_honest_chat_message(self, app, gpt_env, monkeypatch):
++        """Без ключей: AIUnavailable → сообщение с ⚠ в чат, без фабрикации."""
++        from ai_studio_core.ui.controllers.chat_controller import ChatController
++
++        # Прячем ключ, который мог сохранить предыдущий тест в этом файле
++        monkeypatch.setattr(gpt_client, "_SETTINGS_PATH",
++                            str(gpt_env["file"].parent / "empty_settings.json"))
++        ctrl = ChatController()
++        added, statuses = [], []
++        ctrl.message_added.connect(lambda role, content: added.append((role, content)))
++        ctrl.status_message.connect(statuses.append)
++        ctrl.error_occurred.connect(lambda m: None)  # базовый слот тоже есть
++
++        ctrl.on_send("Hi")
++        assert _wait(app, lambda: bool(added), 30), "ожидали честный отказ"
++        role, content = added[-1]
++        assert role == "assistant"
++        assert content.startswith("⚠")
++        assert "AIUnavailable" in content or "провайдер" in content
++        # И ложного «ответа модели» не появилось
++        assert all(not c.startswith("REAL-ECHO") for _r, c in added)
++        assert statuses, "статус тоже должен отражать отказ"
++
++    def test_gate_when_gpt_client_unimportable(self, app, monkeypatch):
++        """Ядро LLM не импортируется → честный гейт ctl_llm_missing, без краша."""
++        import ai_studio_core.ui.controllers.chat_controller as cc
++
++        monkeypatch.setitem(sys.modules, "ai_studio_core.gpt_client", None)
++        ctrl = cc.ChatController()
++        added, statuses = [], []
++        ctrl.message_added.connect(lambda role, content: added.append((role, content)))
++        ctrl.status_message.connect(statuses.append)
++        ctrl.on_send("Hi")
++        assert added == [("assistant", tr("ctl_llm_missing"))]
++        assert statuses == [tr("ctl_llm_missing")]
++
++    def test_available_models_and_select_model(self, app, gpt_configured):
++        from ai_studio_core.ui.controllers.chat_controller import ChatController
++
++        ctrl = ChatController()
++        models = ctrl.available_models()
++        ids = [m["id"] for m in models]
++        assert ids == ["m-alpha", "m-beta"]
++        assert all(m["provider"] == "TestLocal" for m in models)
++        assert all(m["status"] == "ready" for m in models)
++        # Текущая модель подсвечена флагом current
++        current = [m for m in models if m.get("current")]
++        assert len(current) == 1 and current[0]["id"] == "m-alpha"
++
++        ctrl.select_model("m-beta")
++        assert gpt_client.get_model("testlocal") == "m-beta"
++        models = ctrl.available_models()
++        current = [m for m in models if m.get("current")]
++        assert current[0]["id"] == "m-beta"
++
++
++# ── SettingsPanel: реальная персистентность провайдера/ключа ─────────────────
++
++class TestSettingsPanelLLM:
++    def test_panel_lists_custom_provider(self, app, gpt_env):
++        from ai_studio_core.ui.panels.settings_panel import SettingsPanel
++
++        panel = SettingsPanel()
++        ids = [panel._provider.itemData(i) for i in range(panel._provider.count())]
++        assert "groq" in ids and "testlocal" in ids
++
++    def test_panel_saves_provider_and_key(self, app, gpt_env):
++        from ai_studio_core.ui.panels.settings_panel import SettingsPanel
++
++        panel = SettingsPanel()
++        idx = panel._provider.findData("testlocal")
++        assert idx >= 0
++        panel._provider.setCurrentIndex(idx)
++        panel._api_key.setText("panel-secret")
++        saved = []
++        panel.llm_saved.connect(saved.append)
++        panel._save_llm()
++
++        assert saved == ["testlocal"]
++        assert gpt_client.get_provider() == "testlocal"
++        assert gpt_client.get_api_key("testlocal") == "panel-secret"
++        assert panel._api_key.text() == ""  # поле очищено после сохранения
++        raw = gpt_env["file"].read_text(encoding="utf-8")
++        assert "panel-secret" not in raw    # в JSON ключ не plaintext
++
++    def test_key_state_reflects_reality(self, app, gpt_env):
++        from ai_studio_core.ui.panels.settings_panel import SettingsPanel
++
++        panel = SettingsPanel()
++        panel._provider.setCurrentIndex(panel._provider.findData("testlocal"))
++        assert panel._key_state.text() == tr("set_key_state_missing")
++
++        gpt_client.set_api_key("k2", "testlocal")
++        panel._refresh_key_state()
++        assert panel._key_state.text() == tr("set_key_state_ok")
++
++    def test_save_with_empty_key_keeps_existing(self, app, gpt_env):
++        """Пустое поле ключа не затирает сохранённый ранее ключ."""
++        from ai_studio_core.ui.panels.settings_panel import SettingsPanel
++
++        gpt_client.set_api_key("keep-me", "testlocal")
++        panel = SettingsPanel()
++        panel._provider.setCurrentIndex(panel._provider.findData("testlocal"))
++        panel._api_key.setText("")
++        panel._save_llm()
++        assert gpt_client.get_api_key("testlocal") == "keep-me"
++
++
++# ── ModelSelector / ChatWorkspace: честные данные без демонстрашек ───────────
++
++class TestModelSelectorReal:
++    def test_no_demo_stubs_on_construction(self, app):
++        from ai_studio_core.ui.widgets.model_selector import ModelSelector
++
++        for category in ("tts", "llm", "rvc", "image"):
++            assert ModelSelector(category=category).count() == 0
++
++    def test_set_models_preselects_current_silently(self, app):
++        from ai_studio_core.ui.widgets.model_selector import ModelSelector
++
++        sel = ModelSelector(category="llm")
++        seen = []
++        sel.model_changed.connect(seen.append)
++        sel.set_models([
++            {"id": "m1", "name": "Alpha", "provider": "P", "status": "ready"},
++            {"id": "m2", "name": "Beta", "provider": "P", "status": "ready",
++             "current": True},
++        ])
++        assert seen == []                     # пересборка не эмитит
++        assert sel.current_model_id() == "m2"  # current подсвечен
++
++    def test_user_selection_emits_model_id(self, app):
++        from ai_studio_core.ui.widgets.model_selector import ModelSelector
++
++        sel = ModelSelector(category="llm")
++        sel.set_models([
++            {"id": "m1", "name": "Alpha", "provider": "P", "status": "ready"},
++            {"id": "m2", "name": "Beta", "provider": "P", "status": "ready"},
++        ])
++        seen = []
++        sel.model_changed.connect(seen.append)
++        sel.setCurrentIndex(1)
++        assert seen == ["m2"]
++
++    def test_select_id_programmatic_no_signal(self, app):
++        from ai_studio_core.ui.widgets.model_selector import ModelSelector
++
++        sel = ModelSelector(category="llm")
++        sel.set_models([
++            {"id": "m1", "name": "Alpha", "provider": "P", "status": "ready"},
++        ])
++        seen = []
++        sel.model_changed.connect(seen.append)
++        assert sel.select_id("m1") is True
++        assert sel.select_id("nope") is False
++        assert seen == []
++
++    def test_chat_workspace_emits_real_send_params(self, app):
++        from ai_studio_core.ui.workspaces.chat_workspace import ChatWorkspace
++
++        ws = ChatWorkspace()
++        ws.set_models([
++            {"id": "m1", "name": "Alpha", "provider": "P", "status": "ready"},
++            {"id": "m2", "name": "Beta", "provider": "P", "status": "ready",
++             "current": True},
++        ])
++        ws.model_selector().select_id("m1")
++        ws._input.setText("привет")
++        ws._system_prompt.setPlainText("SYS")
++        ws._temp_slider.setValue(42)
++        ws._max_tokens.setCurrentText("512")
++
++        got = []
++        ws.send_requested.connect(lambda *a: got.append(a))
++        ws._on_send()
++
++        assert got == [("привет", "SYS", "m1", 0.42, 512)]
+diff --git a/ai_studio_core/test/test_gpt_client.py b/ai_studio_core/test/test_gpt_client.py
+index 4f57821..b62e16d 100644
+--- a/ai_studio_core/test/test_gpt_client.py
++++ b/ai_studio_core/test/test_gpt_client.py
+@@ -200,7 +200,7 @@ class TestCallWithChain:
+ 
+         calls = []
+ 
+-        def fake_call_api(messages, model=None, max_tokens=0, provider=None):
++        def fake_call_api(messages, model=None, max_tokens=0, provider=None, temperature=0.7):
+             calls.append(model)
+             if model == "primary":
+                 raise GroqRateLimitError("429")
+@@ -217,7 +217,7 @@ class TestCallWithChain:
+         monkeypatch.setattr(gpt_client, "get_model", lambda pid: f"{pid}_model")
+         monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: f"{pid}_model")
+ 
+-        def fake_api(messages, model=None, max_tokens=0, provider=None):
++        def fake_api(messages, model=None, max_tokens=0, provider=None, temperature=0.7):
+             if provider == "groq":
+                 raise GroqNetworkError("no internet")
+             return f"ok from {provider}"
+@@ -256,7 +256,7 @@ class TestCallWithChain:
+         monkeypatch.setattr(gpt_client, "get_model", lambda pid: "m")
+         monkeypatch.setattr(gpt_client, "get_fallback_model", lambda pid: "m")
+ 
+-        def fake_api(messages, model=None, max_tokens=0, provider=None):
++        def fake_api(messages, model=None, max_tokens=0, provider=None, temperature=0.7):
+             if provider == "groq":
+                 raise RuntimeError("unexpected")
+             return "ok openrouter"
+diff --git a/ui_workspace_chat_real.png b/ui_workspace_chat_real.png
+new file mode 100644
+index 0000000..9274eb6
+Binary files /dev/null and b/ui_workspace_chat_real.png differ
